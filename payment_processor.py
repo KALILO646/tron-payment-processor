@@ -8,6 +8,7 @@ import logging
 import hashlib
 import re
 import functools
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Callable, List, Any
@@ -155,7 +156,7 @@ class PaymentProcessor:
         if amount <= 0:
             return False
         
-        if amount != round(amount, 6):
+        if amount != round(amount, 4):
             self.logger.warning(f"Сумма имеет слишком высокую точность: {amount}")
             return False
         
@@ -244,26 +245,41 @@ class PaymentProcessor:
         if transaction.get('currency') != 'USDT':
             return True
         
+        
         OFFICIAL_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
         
         try:
+            if 'trc20_transfer' in transaction:
+                trc20_data = transaction['trc20_transfer']
+                contract_address = trc20_data.get('contract_address', '')
+                
+                if contract_address == OFFICIAL_USDT_CONTRACT:
+                    return True
+                elif contract_address:
+                    self.logger.warning(f"❌ Поддельный USDT контракт: {contract_address}")
+                    return False
+                else:
+                    return True
+            
             tx_details = self.tronscan.get_transaction_details(transaction['transaction_id'])
             if not tx_details:
-                return False
+                return True
             
             transfers = tx_details.get('trc20TransferInfo', [])
+            if not transfers:
+                return True
+            
             for transfer in transfers:
                 token_info = transfer.get('tokenInfo', {})
                 contract_address = token_info.get('tokenId', '')
                 
-                if contract_address != OFFICIAL_USDT_CONTRACT:
-                    self.logger.warning(f"Поддельный USDT контракт: {contract_address}")
+                if contract_address and contract_address != OFFICIAL_USDT_CONTRACT:
+                    self.logger.warning(f"❌ Поддельный USDT контракт: {contract_address}")
                     return False
-            
             return True
         except Exception as e:
             self.logger.error(f"Ошибка при проверке USDT контракта: {e}")
-            return False
+            return True
     
     def _generate_payment_hash(self, form_id: str, amount: float, currency: str) -> str:
         data = f"{form_id}:{amount}:{currency}:{datetime.now().isoformat()}"
@@ -320,9 +336,9 @@ class PaymentProcessor:
             self.logger.error(f"Ошибка при получении сумм активных форм и транзакций: {e}")
             return []
     
-    def _get_blockchain_transaction_amounts(self, currency: str, days_back: int = 7) -> List[float]:
+    def _get_blockchain_transaction_amounts(self, currency: str, hours_back: int = 1) -> List[float]:
         try:
-            since_timestamp = int((datetime.now() - timedelta(days=days_back)).timestamp() * 1000)
+            since_timestamp = int((datetime.now() - timedelta(hours=hours_back)).timestamp() * 1000)
             
             blockchain_txs = self.tronscan.get_account_transactions(
                 self.wallet_address, 
@@ -343,7 +359,7 @@ class PaymentProcessor:
                         if len(amounts) >= 50:
                             break
             
-            self.logger.debug(f"Получено {len(amounts)} сумм из блокчейна за {days_back} дней")
+            self.logger.debug(f"Получено {len(amounts)} сумм из блокчейна за {hours_back} часов")
             return amounts
             
         except Exception as e:
@@ -354,15 +370,15 @@ class PaymentProcessor:
         recent_amounts = self._get_recent_transaction_amounts(currency)
         
         for attempt in range(max_attempts):
-            random_addition = secrets.randbelow(999999) / 1000000.0
-            if random_addition < 0.000001:
-                random_addition = 0.000001
+            random_addition = secrets.randbelow(9999) / 10000.0
+            if random_addition < 0.0001:
+                random_addition = 0.0001
             
-            final_amount = round(base_amount + random_addition, 6)
+            final_amount = round(base_amount + random_addition, 4)
             
             is_unique = True
             for recent_amount in recent_amounts:
-                if abs(final_amount - recent_amount) < 0.000001:
+                if abs(final_amount - recent_amount) < 0.0001:
                     is_unique = False
                     break
             
@@ -370,8 +386,8 @@ class PaymentProcessor:
                 self.logger.debug(f"Сгенерирована уникальная сумма: {final_amount} (попытка {attempt + 1})")
                 return final_amount
         
-        timestamp_suffix = int(datetime.now().timestamp() * 1000) % 1000000 / 1000000.0
-        final_amount = round(base_amount + timestamp_suffix, 6)
+        timestamp_suffix = int(datetime.now().timestamp() * 1000) % 10000 / 10000.0
+        final_amount = round(base_amount + timestamp_suffix, 4)
         self.logger.warning(f"Использована временная метка для генерации суммы: {final_amount}")
         return final_amount
     
@@ -528,7 +544,7 @@ class PaymentProcessor:
         
         return {'status': 'waiting'}
     
-    def start_monitoring(self, check_interval: int = 30):
+    def start_monitoring(self, check_interval: int = 3):
         if self.monitoring:
             return
         
@@ -562,59 +578,38 @@ class PaymentProcessor:
                 
                 self.logger.info(f"🔄 Начат цикл мониторинга: проверяем {len(pending_forms)} активных форм")
                 
-                for form_data in pending_forms:
-                    if not self.monitoring:
-                        break
-                        
-                    form_id = form_data['form_id']
+                since_hours = 1
+                since_timestamp = int((datetime.now() - timedelta(hours=since_hours)).timestamp() * 1000)
+                
+                try:
+                    recent_txs = self.tronscan.check_recent_transactions(
+                        self.wallet_address, 
+                        since_timestamp=since_timestamp
+                    )
                     
-                    try:
-                        since_hours = 1
-                        since_timestamp = int((datetime.now() - timedelta(hours=since_hours)).timestamp() * 1000)
-                        
-                        self.logger.debug(f"🔍 Проверка транзакций для формы {form_id} за последние {since_hours} часов")
-                        
-                        
-                        recent_txs = self.tronscan.check_recent_transactions(
-                            self.wallet_address, 
-                            since_timestamp=since_timestamp
-                        )
-                        
-                        self.logger.info(f"📥 Получено {len(recent_txs)} транзакций за {since_hours}ч для проверки формы {form_id}")
-                        
-                        
-                        for i, tx in enumerate(recent_txs):
-                            if not self.monitoring:
-                                break
-                                
-                            tx_hash = tx.get('hash', 'unknown')
-                            self.logger.debug(f"🔄 Обработка транзакции {i+1}/{len(recent_txs)}: {tx_hash[:16]}...")
-                                
-                            try:
-                                parsed_tx = self.tronscan.parse_transaction(tx)
-                                
-                                if not parsed_tx:
-                                    self.logger.debug(f"⚠️  Транзакция {tx_hash[:16]} не удалось распарсить")
-                                    continue
-                                
-                                self.logger.info(f"💰 Распарсена транзакция: {parsed_tx['amount']} {parsed_tx['currency']} "
-                                                f"от {self._mask_wallet_address(parsed_tx['from_address'])} "
-                                                f"к {self._mask_wallet_address(parsed_tx['to_address'])}")
-                                
-                                
-                                if self._is_payment_for_form(parsed_tx, form_data):
-                                    self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
-                                    self._process_payment(parsed_tx, form_id)
-                                else:
-                                    self.logger.debug(f"❌ Транзакция не подходит для формы {form_id}")
+                    self.logger.info(f"📥 Получено {len(recent_txs)} транзакций за {since_hours}ч для проверки {len(pending_forms)} форм")
+                    
+                    if recent_txs:
+                        with ThreadPoolExecutor(max_workers=5) as executor:
+                            future_to_form = {
+                                executor.submit(self._check_form_against_transactions, form_data, recent_txs): form_data
+                                for form_data in pending_forms
+                            }
+                            
+                            for future in as_completed(future_to_form):
+                                if not self.monitoring:
+                                    break
                                     
-                            except Exception as e:
-                                self.logger.error(f"💥 Ошибка при обработке транзакции {tx_hash[:16]}: {e}")
-                                continue
-                                
-                    except Exception as e:
-                        self.logger.error(f"Ошибка при получении транзакций для формы {form_id}: {e}")
-                        continue
+                                try:
+                                    result = future.result()
+                                except Exception as e:
+                                    form_data = future_to_form[future]
+                                    form_id = form_data['form_id']
+                                    self.logger.error(f"Ошибка при проверке формы {form_id}: {e}")
+                                    
+                except Exception as e:
+                    self.logger.error(f"Ошибка при получении транзакций: {e}")
+                    continue
                 
                 consecutive_errors = 0
                 time.sleep(check_interval)
@@ -644,6 +639,61 @@ class PaymentProcessor:
             self.logger.error(f"Ошибка при получении активных форм: {e}")
             return []
     
+    def _check_form_against_transactions(self, form_data: Dict, transactions: List[Dict]) -> bool:
+        """Проверяет одну платежную форму против списка транзакций"""
+        form_id = form_data['form_id']
+        
+        for tx in transactions:
+            if not self.monitoring:
+                return False
+                
+            try:
+                parsed_tx = self.tronscan.parse_transaction(tx)
+                
+                if not parsed_tx:
+                    continue
+                
+                self.logger.debug(f"💰 Проверка транзакции: {parsed_tx['amount']} {parsed_tx['currency']} "
+                               f"от {self._mask_wallet_address(parsed_tx['from_address'])} "
+                               f"к {self._mask_wallet_address(parsed_tx['to_address'])}")
+                
+                if self._is_payment_for_form(parsed_tx, form_data):
+                    self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
+                    self._process_payment(parsed_tx, form_id)
+                    return True
+                    
+            except Exception as e:
+                tx_hash = tx.get('hash', 'unknown')
+                self.logger.error(f"Ошибка при обработке транзакции {tx_hash[:16]} для формы {form_id}: {e}")
+                continue
+                
+        return False
+
+    def _process_transaction_for_form(self, tx: Dict, form_data: Dict, form_id: str) -> bool:
+        """Обрабатывает одну транзакцию для проверки соответствия платежной форме"""
+        tx_hash = tx.get('hash', 'unknown')
+        try:
+            parsed_tx = self.tronscan.parse_transaction(tx)
+            
+            if not parsed_tx:
+                self.logger.debug(f"⚠️  Транзакция {tx_hash[:16]} не удалось распарсить")
+                return False
+            
+            self.logger.debug(f"💰 Распарсена транзакция: {parsed_tx['amount']} {parsed_tx['currency']} "
+                           f"от {self._mask_wallet_address(parsed_tx['from_address'])} "
+                           f"к {self._mask_wallet_address(parsed_tx['to_address'])}")
+            
+            if self._is_payment_for_form(parsed_tx, form_data):
+                self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
+                self._process_payment(parsed_tx, form_id)
+                return True
+            else:
+                self.logger.debug(f"❌ Транзакция не подходит для формы {form_id}")
+                return False
+        except Exception as e:
+            self.logger.error(f"Ошибка при обработке транзакции {tx_hash[:16]}: {e}")
+            return False
+
     def _is_payment_for_form(self, transaction: Dict, form_data: Dict) -> bool:
         tx_id = transaction['transaction_id']
         form_id = form_data['form_id']
@@ -674,7 +724,7 @@ class PaymentProcessor:
         
         tx_amount = transaction['amount']
         form_amount = form_data['amount'] 
-        amount_match = abs(tx_amount - form_amount) < 0.000001
+        amount_match = abs(tx_amount - form_amount) < 0.0001
         
         tx_currency = transaction['currency']
         form_currency = form_data['currency']

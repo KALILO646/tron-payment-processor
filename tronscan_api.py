@@ -106,7 +106,7 @@ class TronScanAPI:
     def _validate_ssl_certificate(self, hostname: str) -> bool:
         return True
     
-    def _make_request(self, url: str, params: dict = None, timeout: int = 10, max_retries: int = 3) -> requests.Response:
+    def _make_request(self, url: str, params: dict = None, timeout: int = 5, max_retries: int = 3) -> requests.Response:
         if not url.startswith(self.api_url):
             raise ValueError(f"Подозрительный URL запроса: {url}")
         
@@ -217,7 +217,7 @@ class TronScanAPI:
                 'sort': '-timestamp'
             }
             
-            response = self._make_request(url, params=params, timeout=10)
+            response = self._make_request(url, params=params, timeout=5)
             response.raise_for_status()
             
             try:
@@ -255,7 +255,7 @@ class TronScanAPI:
                 'sort': '-timestamp'
             }
             
-            response = self._make_request(url, params=params, timeout=10)
+            response = self._make_request(url, params=params, timeout=5)
             response.raise_for_status()
             
             try:
@@ -298,7 +298,7 @@ class TronScanAPI:
             url = f"{self.api_url}/transaction-info"
             params = {'hash': transaction_id}
             
-            response = self._make_request(url, params=params, timeout=10)
+            response = self._make_request(url, params=params, timeout=5)
             response.raise_for_status()
             
             data = response.json()
@@ -312,7 +312,7 @@ class TronScanAPI:
             url = f"{self.api_url}/account"
             params = {'address': address}
             
-            response = self._make_request(url, params=params, timeout=10)
+            response = self._make_request(url, params=params, timeout=5)
             response.raise_for_status()
             
             data = response.json()

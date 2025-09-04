@@ -102,6 +102,12 @@ class DatabaseManager:
             )
         ''')
         
+        try:
+            cursor.execute('ALTER TABLE payment_forms ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+            self.logger.info("Добавлена колонка updated_at в таблицу payment_forms")
+        except sqlite3.OperationalError:
+            pass
+        
         conn.commit()
         conn.close()
     
@@ -178,7 +184,7 @@ class DatabaseManager:
                         conn.rollback()
                         return {'status': 'error', 'message': 'Payment form expired'}
                     
-                    if abs(amount - expected_amount) > 0.000001 or currency != expected_currency:
+                    if abs(amount - expected_amount) > 0.0001 or currency != expected_currency:
                         conn.rollback()
                         return {'status': 'error', 'message': 'Amount or currency mismatch'}
                     
