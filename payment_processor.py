@@ -299,18 +299,55 @@ class PaymentProcessor:
     
     def _get_recent_transaction_amounts(self, currency: str) -> List[float]:
         try:
+            current_time = datetime.now().timestamp()
+            active_forms = self.db.get_active_payment_forms(current_time)
             recent_txs = self.db.get_pending_transactions()
             
             amounts = []
+            
+            for form in active_forms:
+                if form['currency'] == currency:
+                    amounts.append(form['amount'])
+            
             for tx in recent_txs:
                 if tx['currency'] == currency:
                     amounts.append(tx['amount'])
-                    if len(amounts) >= 5:
+                    if len(amounts) >= 20:
                         break
             
             return amounts
         except Exception as e:
-            self.logger.error(f"Ошибка при получении последних транзакций: {e}")
+            self.logger.error(f"Ошибка при получении сумм активных форм и транзакций: {e}")
+            return []
+    
+    def _get_blockchain_transaction_amounts(self, currency: str, days_back: int = 7) -> List[float]:
+        try:
+            since_timestamp = int((datetime.now() - timedelta(days=days_back)).timestamp() * 1000)
+            
+            blockchain_txs = self.tronscan.get_account_transactions(
+                self.wallet_address, 
+                limit=100,
+                start=0
+            )
+            
+            amounts = []
+            for tx in blockchain_txs:
+                tx_timestamp = tx.get('timestamp', 0)
+                if tx_timestamp < since_timestamp:
+                    continue
+                    
+                parsed_tx = self.tronscan.parse_transaction(tx)
+                if parsed_tx and parsed_tx['currency'] == currency:
+                    if parsed_tx['to_address'].lower() == self.wallet_address.lower():
+                        amounts.append(parsed_tx['amount'])
+                        if len(amounts) >= 50:
+                            break
+            
+            self.logger.debug(f"Получено {len(amounts)} сумм из блокчейна за {days_back} дней")
+            return amounts
+            
+        except Exception as e:
+            self.logger.error(f"Ошибка при получении сумм из блокчейна: {e}")
             return []
     
     def _generate_unique_amount(self, base_amount: float, currency: str, max_attempts: int = 100) -> float:
@@ -340,10 +377,18 @@ class PaymentProcessor:
     
     def _check_recent_transactions(self, amount: float, currency: str) -> bool:
         try:
-            recent_amounts = self._get_recent_transaction_amounts(currency)
+            local_amounts = self._get_recent_transaction_amounts(currency)
             
-            for recent_amount in recent_amounts:
+            for recent_amount in local_amounts:
                 if abs(amount - recent_amount) < 0.01:
+                    self.logger.warning(f"Сумма {amount} слишком похожа на локальную транзакцию: {recent_amount}")
+                    return False
+            
+            blockchain_amounts = self._get_blockchain_transaction_amounts(currency)
+            
+            for blockchain_amount in blockchain_amounts:
+                if abs(amount - blockchain_amount) < 0.01:
+                    self.logger.warning(f"Сумма {amount} слишком похожа на блокчейн транзакцию: {blockchain_amount}")
                     return False
             
             return True
