@@ -44,72 +44,87 @@ class DatabaseManager:
     @contextlib.contextmanager
     def get_connection(self):
         conn = None
+        from_pool = False
         try:
             conn = self.connection_pool.get(timeout=10.0)
+            from_pool = True
             
             try:
                 conn.execute('SELECT 1')
             except sqlite3.Error:
                 conn.close()
                 conn = self._create_connection()
+                from_pool = False
             
             yield conn
             
         except queue.Empty:
             self.logger.warning("Connection pool exhausted, creating temporary connection")
             conn = self._create_connection()
+            from_pool = False
             yield conn
             
         finally:
             if conn:
-                try:
-                    self.connection_pool.put_nowait(conn)
-                except queue.Full:
+                if from_pool:
+                    try:
+                        self.connection_pool.put_nowait(conn)
+                    except queue.Full:
+                        conn.close()
+                else:
                     conn.close()
     
     def init_database(self):
-        conn = self._create_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS transactions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                transaction_id TEXT UNIQUE NOT NULL,
-                from_address TEXT NOT NULL,
-                to_address TEXT NOT NULL,
-                amount REAL NOT NULL,
-                currency TEXT NOT NULL,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                payment_form_id TEXT,
-                description TEXT
-            )
-        ''')
-        
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS payment_forms (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                form_id TEXT UNIQUE NOT NULL,
-                amount REAL NOT NULL,
-                currency TEXT NOT NULL,
-                description TEXT,
-                status TEXT NOT NULL,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                expires_at TIMESTAMP,
-                wallet_address TEXT NOT NULL
-            )
-        ''')
-        
-        try:
-            cursor.execute('ALTER TABLE payment_forms ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-            self.logger.info("Добавлена колонка updated_at в таблицу payment_forms")
-        except sqlite3.OperationalError:
-            pass
-        
-        conn.commit()
-        conn.close()
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    transaction_id TEXT UNIQUE NOT NULL,
+                    from_address TEXT NOT NULL,
+                    to_address TEXT NOT NULL,
+                    amount REAL NOT NULL,
+                    currency TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    payment_form_id TEXT,
+                    description TEXT
+                )
+            ''')
+            
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_transaction_id ON transactions(transaction_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_payment_form_id ON transactions(payment_form_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON transactions(status)')
+            
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS payment_forms (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    form_id TEXT UNIQUE NOT NULL,
+                    amount REAL NOT NULL,
+                    currency TEXT NOT NULL,
+                    description TEXT,
+                    status TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    wallet_address TEXT NOT NULL
+                )
+            ''')
+            
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_id ON payment_forms(form_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_status ON payment_forms(status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_expires ON payment_forms(expires_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_status_expires ON payment_forms(status, expires_at)')
+            
+            try:
+                cursor.execute('ALTER TABLE payment_forms ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+                self.logger.info("Добавлена колонка updated_at в таблицу payment_forms")
+            except sqlite3.OperationalError:
+                pass
+            
+            conn.commit()
     
     def create_payment_form(self, form_id: str, amount: float, currency: str, 
                           description: str, wallet_address: str, expires_hours: int = 24) -> bool:
@@ -246,14 +261,13 @@ class DatabaseManager:
             cursor = conn.cursor()
             
             cursor.execute('''
-                SELECT * FROM transactions WHERE transaction_id = ?
+                SELECT id, transaction_id, status FROM transactions WHERE transaction_id = ? LIMIT 1
             ''', (transaction_id,))
             
             row = cursor.fetchone()
             
             if row:
-                columns = [description[0] for description in cursor.description]
-                return dict(zip(columns, row))
+                return {'id': row[0], 'transaction_id': row[1], 'status': row[2]}
             
             return None
     
@@ -292,10 +306,32 @@ class DatabaseManager:
             cursor = conn.cursor()
             
             cursor.execute('''
+                UPDATE payment_forms 
+                SET status = 'expired', updated_at = CURRENT_TIMESTAMP 
+                WHERE status = 'pending' AND expires_at <= ?
+            ''', (current_time,))
+            
+            cursor.execute('''
                 SELECT * FROM payment_forms 
                 WHERE status = 'pending' AND expires_at > ?
                 ORDER BY created_at DESC
             ''', (current_time,))
+            
+            rows = cursor.fetchall()
+            columns = [description[0] for description in cursor.description]
+            
+            conn.commit()
+            return [dict(zip(columns, row)) for row in rows]
+    
+    def get_all_payment_forms(self) -> List[Dict]:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT form_id, amount, currency, status, created_at, expires_at, description 
+                FROM payment_forms 
+                ORDER BY created_at DESC
+            ''')
             
             rows = cursor.fetchall()
             columns = [description[0] for description in cursor.description]

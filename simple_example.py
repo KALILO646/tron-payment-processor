@@ -14,7 +14,7 @@ def main():
         qr_generator = QRCodeGenerator()
         
         print("✅ Модуль успешно инициализирован")
-        print(f"🏦 Адрес кошелька: {payment_processor.wallet_address}")
+        print(f"🏦 Адрес кошелька: {payment_processor._mask_wallet_address(payment_processor.wallet_address)}")
         
         print("\n💳 Создание тестовой платежной формы...")
         payment_form = payment_processor.create_payment_form(
@@ -59,7 +59,7 @@ def main():
         payment_processor.start_monitoring(check_interval=10)
         
         print("\n📋 Информация для оплаты:")
-        print(f"   Адрес кошелька: {payment_processor.wallet_address}")
+        print(f"   Адрес кошелька: {payment_processor._mask_wallet_address(payment_processor.wallet_address)}")
         print(f"   К доплате: {payment_form['amount']} {payment_form['currency']}")
         print(f"   QR-код: {qr_filepath if qr_filepath else 'Не создан'}")
         print(f"   QR данные: {qr_data}")

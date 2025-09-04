@@ -37,6 +37,9 @@ class TronScanAPI:
         self.min_request_interval = 60.0 / requests_per_minute
         self.last_429_time = 0
         self.backoff_multiplier = 1
+        self._response_cache = {}
+        self._cache_lock = Lock()
+        self._cache_ttl = 30
     
     def _validate_api_url(self, url: str) -> bool:
         allowed_domains = [
@@ -208,6 +211,16 @@ class TronScanAPI:
         return True
     
     def get_account_transactions(self, address: str, limit: int = 20, start: int = 0) -> List[Dict]:
+        cache_key = f"tx_{address}_{limit}_{start}"
+        
+        with self._cache_lock:
+            if cache_key in self._response_cache:
+                cached_data, cache_time = self._response_cache[cache_key]
+                if time.time() - cache_time < self._cache_ttl:
+                    return cached_data
+                else:
+                    del self._response_cache[cache_key]
+        
         try:
             url = f"{self.api_url}/transaction"
             params = {
@@ -238,6 +251,14 @@ class TronScanAPI:
                 else:
                     self.logger.warning(f"Отклонена невалидная транзакция: {tx.get('hash', 'unknown')}")
             
+            with self._cache_lock:
+                self._response_cache[cache_key] = (validated_transactions, time.time())
+                
+                if len(self._response_cache) > 100:
+                    oldest_key = min(self._response_cache.keys(), 
+                                   key=lambda k: self._response_cache[k][1])
+                    del self._response_cache[oldest_key]
+            
             self.logger.info(f"Получено {len(validated_transactions)} валидных транзакций из {len(transactions)}")
             return validated_transactions
             
@@ -246,6 +267,16 @@ class TronScanAPI:
             return []
     
     def get_trc20_transfers(self, address: str, limit: int = 20, start: int = 0) -> List[Dict]:
+        cache_key = f"trc20_{address}_{limit}_{start}"
+        
+        with self._cache_lock:
+            if cache_key in self._response_cache:
+                cached_data, cache_time = self._response_cache[cache_key]
+                if time.time() - cache_time < self._cache_ttl:
+                    return cached_data
+                else:
+                    del self._response_cache[cache_key]
+        
         try:
             url = f"{self.api_url}/token_trc20/transfers"
             params = {
@@ -286,6 +317,9 @@ class TronScanAPI:
                     self.logger.warning(f"Ошибка при обработке TRC20 перевода: {e}")
                     continue
             
+            with self._cache_lock:
+                self._response_cache[cache_key] = (trc20_transactions, time.time())
+            
             self.logger.info(f"Получено {len(trc20_transactions)} TRC20 переводов")
             return trc20_transactions
             
@@ -323,7 +357,7 @@ class TronScanAPI:
     
     def check_recent_transactions(self, wallet_address: str, since_timestamp: int = None) -> List[Dict]:
         if since_timestamp is None:
-            since_timestamp = int((datetime.now() - timedelta(hours=1)).timestamp() * 1000)
+            since_timestamp = int((datetime.now() - timedelta(hours=2)).timestamp() * 1000)
         
         transactions = self.get_account_transactions(wallet_address, limit=50)
         trc20_transfers = self.get_trc20_transfers(wallet_address, limit=50)
@@ -339,7 +373,7 @@ class TronScanAPI:
                 recent_transactions.append(tx)
         recent_transactions.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
         
-        self.logger.info(f"Найдено {len(recent_transactions)} транзакций (TRX: {len(transactions)}, TRC20: {len(trc20_transfers)})")
+        self.logger.info(f"Найдено {len(recent_transactions)} транзакций за 2 часа (TRX: {len(transactions)}, TRC20: {len(trc20_transfers)})")
         return recent_transactions
     
     def is_transaction_confirmed(self, transaction_id: str) -> bool:

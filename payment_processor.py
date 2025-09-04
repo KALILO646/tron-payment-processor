@@ -8,6 +8,7 @@ import logging
 import hashlib
 import re
 import functools
+import math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 from datetime import datetime, timedelta
@@ -50,6 +51,8 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 
     return decorator
 
 class PaymentProcessor:
+    OFFICIAL_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+    
     def __init__(self, log_level: str = "INFO"):
         self.logger = logging.getLogger(__name__)
         self.logger.setLevel(getattr(logging, log_level.upper()))
@@ -75,6 +78,14 @@ class PaymentProcessor:
             self.monitoring = False
             self.monitor_thread = None
             self.payment_callbacks = {}
+            self._form_creation_lock = threading.Lock()
+            self._last_form_creation_time = 0
+            self._processed_transactions = set()
+            self._transaction_cache_lock = threading.Lock()
+            self._last_block_timestamp = 0
+            self._form_cache = {}
+            self._form_cache_lock = threading.Lock()
+            self._cache_expiry = 300
             
             self.logger.info(f"PaymentProcessor инициализирован для кошелька: {self._mask_wallet_address(self.wallet_address)}")
             
@@ -145,7 +156,7 @@ class PaymentProcessor:
             return False
         
         try:
-            if not (amount == amount):
+            if math.isnan(amount):
                 return False
         except (TypeError, ValueError):
             return False
@@ -199,7 +210,7 @@ class PaymentProcessor:
         tx_timestamp = transaction.get('timestamp', 0)
         current_time = int(datetime.now().timestamp() * 1000)
         
-        max_age = 60 * 60 * 1000
+        max_age = 2 * 60 * 60 * 1000
         
         if current_time - tx_timestamp > max_age:
             age_minutes = (current_time - tx_timestamp) / 1000 / 60
@@ -246,14 +257,13 @@ class PaymentProcessor:
             return True
         
         
-        OFFICIAL_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
         
         try:
             if 'trc20_transfer' in transaction:
                 trc20_data = transaction['trc20_transfer']
                 contract_address = trc20_data.get('contract_address', '')
                 
-                if contract_address == OFFICIAL_USDT_CONTRACT:
+                if contract_address == self.OFFICIAL_USDT_CONTRACT:
                     return True
                 elif contract_address:
                     self.logger.warning(f"❌ Поддельный USDT контракт: {contract_address}")
@@ -273,7 +283,7 @@ class PaymentProcessor:
                 token_info = transfer.get('tokenInfo', {})
                 contract_address = token_info.get('tokenId', '')
                 
-                if contract_address and contract_address != OFFICIAL_USDT_CONTRACT:
+                if contract_address and contract_address != self.OFFICIAL_USDT_CONTRACT:
                     self.logger.warning(f"❌ Поддельный USDT контракт: {contract_address}")
                     return False
             return True
@@ -286,7 +296,6 @@ class PaymentProcessor:
         return hashlib.sha256(data.encode()).hexdigest()[:16]
     
     def _check_form_creation_limits(self, client_ip: str = None, user_id: str = None):
-        
         try:
             active_forms_count = len(self.db.get_active_payment_forms(datetime.now().timestamp()))
             max_total_forms = 1000
@@ -300,14 +309,12 @@ class PaymentProcessor:
             if user_id:
                 self.logger.info(f"Создание формы для пользователя: {user_id}")
             
-            current_time = time.time()
-            
-            if hasattr(self, '_last_form_creation_time'):
+            with self._form_creation_lock:
+                current_time = time.time()
                 time_since_last = current_time - self._last_form_creation_time
                 if time_since_last < 1.0:
                     raise Exception(f"Слишком частое создание форм. Подождите {1.0 - time_since_last:.1f} секунд")
-            
-            self._last_form_creation_time = current_time
+                self._last_form_creation_time = current_time
             
         except Exception as e:
             self.logger.error(f"Превышен лимит создания форм: {e}")
@@ -413,7 +420,7 @@ class PaymentProcessor:
             return True
     
     def create_payment_form(self, amount: float, currency: str = "TRX", 
-                          description: str = "", expires_hours: int = 24, 
+                          description: str = "", expires_hours: int = None, 
                           client_ip: str = None, user_id: str = None) -> Dict:
         
         if not isinstance(amount, (int, float)):
@@ -424,6 +431,9 @@ class PaymentProcessor:
             
         if not isinstance(description, str):
             raise ValueError(f"description должен быть строкой, получен {type(description)}")
+        
+        if expires_hours is None:
+            expires_hours = int(os.getenv('MAX_FORM_LIFETIME', 24))
             
         if not isinstance(expires_hours, int):
             raise ValueError(f"expires_hours должен быть целым числом, получен {type(expires_hours)}")
@@ -483,7 +493,22 @@ class PaymentProcessor:
             raise Exception("Не удалось создать платежную форму")
     
     def get_payment_form(self, form_id: str) -> Optional[Dict]:
-        return self.db.get_payment_form(form_id)
+        with self._form_cache_lock:
+            cache_key = f"form_{form_id}"
+            current_time = time.time()
+            
+            if cache_key in self._form_cache:
+                cached_data, cache_time = self._form_cache[cache_key]
+                if current_time - cache_time < self._cache_expiry:
+                    return cached_data
+                else:
+                    del self._form_cache[cache_key]
+            
+            form_data = self.db.get_payment_form(form_id)
+            if form_data:
+                self._form_cache[cache_key] = (form_data, current_time)
+            
+            return form_data
     
     def generate_payment_url(self, form_id: str) -> str:
         form_data = self.get_payment_form(form_id)
@@ -496,8 +521,7 @@ class PaymentProcessor:
         if currency == "TRX":
             return f"tronlink://send?address={self.wallet_address}&amount={amount}"
         elif currency == "USDT":
-            usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-            return f"tronlink://send?address={self.wallet_address}&amount={amount}&token={usdt_contract}"
+            return f"tronlink://send?address={self.wallet_address}&amount={amount}&token={self.OFFICIAL_USDT_CONTRACT}"
         else:
             return f"tronlink://send?address={self.wallet_address}&amount={amount}&token={currency}"
     
@@ -512,8 +536,7 @@ class PaymentProcessor:
         if currency == "TRX":
             return f"tron:{self.wallet_address}?amount={amount}"
         elif currency == "USDT":
-            usdt_contract = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-            return f"tron:{self.wallet_address}?amount={amount}&token={usdt_contract}"
+            return f"tron:{self.wallet_address}?amount={amount}&token={self.OFFICIAL_USDT_CONTRACT}"
         else:
             return f"tron:{self.wallet_address}?amount={amount}&token={currency}"
     
@@ -578,8 +601,8 @@ class PaymentProcessor:
                 
                 self.logger.info(f"🔄 Начат цикл мониторинга: проверяем {len(pending_forms)} активных форм")
                 
-                since_hours = 1
-                since_timestamp = int((datetime.now() - timedelta(hours=since_hours)).timestamp() * 1000)
+                since_timestamp = max(self._last_block_timestamp, 
+                                    int((datetime.now() - timedelta(hours=2)).timestamp() * 1000))
                 
                 try:
                     recent_txs = self.tronscan.check_recent_transactions(
@@ -587,21 +610,27 @@ class PaymentProcessor:
                         since_timestamp=since_timestamp
                     )
                     
-                    self.logger.info(f"📥 Получено {len(recent_txs)} транзакций за {since_hours}ч для проверки {len(pending_forms)} форм")
+                    new_transactions = self._filter_new_transactions(recent_txs)
                     
-                    if recent_txs:
-                        with ThreadPoolExecutor(max_workers=5) as executor:
-                            future_to_form = {
-                                executor.submit(self._check_form_against_transactions, form_data, recent_txs): form_data
-                                for form_data in pending_forms
-                            }
+                    self.logger.info(f"📥 Получено {len(new_transactions)} новых транзакций из {len(recent_txs)} за 2 часа для проверки {len(pending_forms)} форм")
+                    
+                    if new_transactions:
+                        self._update_last_block_timestamp(new_transactions)
+                        
+                        with ThreadPoolExecutor(max_workers=min(10, len(pending_forms))) as executor:
+                            future_to_form = {}
                             
-                            for future in as_completed(future_to_form):
+                            for form_data in pending_forms:
+                                future = executor.submit(self._check_form_against_transactions_optimized, 
+                                                       form_data, new_transactions)
+                                future_to_form[future] = form_data
+                            
+                            for future in as_completed(future_to_form, timeout=30):
                                 if not self.monitoring:
                                     break
                                     
                                 try:
-                                    result = future.result()
+                                    result = future.result(timeout=5)
                                 except Exception as e:
                                     form_data = future_to_form[future]
                                     form_id = form_data['form_id']
@@ -631,36 +660,77 @@ class PaymentProcessor:
                 self.logger.info(f"Пауза {error_sleep} секунд перед повтором мониторинга")
                 time.sleep(error_sleep)
     
+    def _filter_new_transactions(self, transactions: List[Dict]) -> List[Dict]:
+        with self._transaction_cache_lock:
+            new_transactions = []
+            for tx in transactions:
+                tx_hash = tx.get('hash', '')
+                if tx_hash and tx_hash not in self._processed_transactions:
+                    new_transactions.append(tx)
+                    self._processed_transactions.add(tx_hash)
+            
+            if len(self._processed_transactions) > 10000:
+                oldest_txs = list(self._processed_transactions)[:5000]
+                for tx_hash in oldest_txs:
+                    self._processed_transactions.discard(tx_hash)
+            
+            return new_transactions
+    
+    def _update_last_block_timestamp(self, transactions: List[Dict]):
+        if transactions:
+            max_timestamp = max(tx.get('timestamp', 0) for tx in transactions)
+            if max_timestamp > self._last_block_timestamp:
+                self._last_block_timestamp = max_timestamp
+    
     def _get_active_payment_forms(self) -> list:
         try:
-            current_time = datetime.now().timestamp()
-            return self.db.get_active_payment_forms(current_time)
+            with self._form_cache_lock:
+                cache_key = "active_forms"
+                current_time = time.time()
+                
+                if cache_key in self._form_cache:
+                    cached_data, cache_time = self._form_cache[cache_key]
+                    if current_time - cache_time < 10:
+                        return cached_data
+                    else:
+                        del self._form_cache[cache_key]
+                
+                active_forms = self.db.get_active_payment_forms(datetime.now().timestamp())
+                self._form_cache[cache_key] = (active_forms, current_time)
+                
+                return active_forms
         except Exception as e:
             self.logger.error(f"Ошибка при получении активных форм: {e}")
             return []
     
-    def _check_form_against_transactions(self, form_data: Dict, transactions: List[Dict]) -> bool:
-        """Проверяет одну платежную форму против списка транзакций"""
+    def _check_form_against_transactions_optimized(self, form_data: Dict, transactions: List[Dict]) -> bool:
         form_id = form_data['form_id']
+        form_amount = form_data['amount']
+        form_currency = form_data['currency']
+        wallet_address_lower = self.wallet_address.lower()
         
         for tx in transactions:
             if not self.monitoring:
                 return False
                 
             try:
-                parsed_tx = self.tronscan.parse_transaction(tx)
+                tx_hash = tx.get('hash', '')
+                if self.db.get_transaction_by_id(tx_hash):
+                    continue
                 
+                parsed_tx = self._parse_transaction_fast(tx)
                 if not parsed_tx:
                     continue
                 
-                self.logger.debug(f"💰 Проверка транзакции: {parsed_tx['amount']} {parsed_tx['currency']} "
-                               f"от {self._mask_wallet_address(parsed_tx['from_address'])} "
-                               f"к {self._mask_wallet_address(parsed_tx['to_address'])}")
-                
-                if self._is_payment_for_form(parsed_tx, form_data):
-                    self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
-                    self._process_payment(parsed_tx, form_id)
-                    return True
+                if (abs(parsed_tx['amount'] - form_amount) < 0.0001 and
+                    parsed_tx['currency'] == form_currency and
+                    parsed_tx['to_address'].lower() == wallet_address_lower and
+                    parsed_tx.get('confirmed', False)):
+                    
+                    if self._validate_transaction_fast(parsed_tx):
+                        self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
+                        self._process_payment(parsed_tx, form_id)
+                        return True
                     
             except Exception as e:
                 tx_hash = tx.get('hash', 'unknown')
@@ -668,31 +738,56 @@ class PaymentProcessor:
                 continue
                 
         return False
-
-    def _process_transaction_for_form(self, tx: Dict, form_data: Dict, form_id: str) -> bool:
-        """Обрабатывает одну транзакцию для проверки соответствия платежной форме"""
-        tx_hash = tx.get('hash', 'unknown')
+    
+    def _parse_transaction_fast(self, tx_data: Dict) -> Optional[Dict]:
         try:
-            parsed_tx = self.tronscan.parse_transaction(tx)
+            tx_id = tx_data.get('hash', '')
+            timestamp = tx_data.get('timestamp', 0)
             
-            if not parsed_tx:
-                self.logger.debug(f"⚠️  Транзакция {tx_hash[:16]} не удалось распарсить")
-                return False
+            if 'trc20_transfer' in tx_data:
+                transfer = tx_data['trc20_transfer']
+                amount_str = transfer.get('quant', '0')
+                from_addr = transfer.get('from_address', '')
+                to_addr = transfer.get('to_address', '')
+                
+                token_info = transfer.get('tokenInfo', {})
+                symbol = token_info.get('tokenAbbr', 'UNKNOWN')
+                decimals = token_info.get('tokenDecimal', 6)
+                
+                try:
+                    amount = float(amount_str)
+                    if decimals > 0:
+                        amount = amount / (10 ** decimals)
+                except (ValueError, TypeError):
+                    return None
+                
+                return {
+                    'transaction_id': tx_id,
+                    'from_address': from_addr,
+                    'to_address': to_addr,
+                    'amount': amount,
+                    'currency': symbol,
+                    'timestamp': timestamp * 1000 if timestamp < 1000000000000 else timestamp,
+                    'confirmed': tx_data.get('confirmed', True)
+                }
             
-            self.logger.debug(f"💰 Распарсена транзакция: {parsed_tx['amount']} {parsed_tx['currency']} "
-                           f"от {self._mask_wallet_address(parsed_tx['from_address'])} "
-                           f"к {self._mask_wallet_address(parsed_tx['to_address'])}")
-            
-            if self._is_payment_for_form(parsed_tx, form_data):
-                self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
-                self._process_payment(parsed_tx, form_id)
-                return True
-            else:
-                self.logger.debug(f"❌ Транзакция не подходит для формы {form_id}")
-                return False
-        except Exception as e:
-            self.logger.error(f"Ошибка при обработке транзакции {tx_hash[:16]}: {e}")
+            return None
+        except Exception:
+            return None
+    
+    def _validate_transaction_fast(self, transaction: Dict) -> bool:
+        from_address = transaction.get('from_address', '')
+        if not self._validate_sender_address(from_address):
             return False
+        
+        if not self._validate_transaction_timestamp(transaction):
+            return False
+            
+        if transaction.get('currency') == 'USDT':
+            return self._validate_usdt_contract(transaction)
+        
+        return True
+
 
     def _is_payment_for_form(self, transaction: Dict, form_data: Dict) -> bool:
         tx_id = transaction['transaction_id']
