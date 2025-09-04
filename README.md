@@ -1,5 +1,4 @@
 # 💰 TRON Payment Processor - USDT Payments for Telegram Bots
-🚀 Python module for processing TRON/USDT cryptocurrency payments with automatic monitoring, QR code generation, and Telegram bot integration
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
