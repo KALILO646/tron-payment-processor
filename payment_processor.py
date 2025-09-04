@@ -556,9 +556,11 @@ class PaymentProcessor:
                 pending_forms = self._get_active_payment_forms()
                 
                 if not pending_forms:
-                    self.logger.debug("Нет активных платежных форм для мониторинга")
+                    self.logger.debug("💤 Нет активных платежных форм для мониторинга")
                     time.sleep(check_interval)
                     continue
+                
+                self.logger.info(f"🔄 Начат цикл мониторинга: проверяем {len(pending_forms)} активных форм")
                 
                 for form_data in pending_forms:
                     if not self.monitoring:
@@ -567,21 +569,47 @@ class PaymentProcessor:
                     form_id = form_data['form_id']
                     
                     try:
+                        since_hours = 1
+                        since_timestamp = int((datetime.now() - timedelta(hours=since_hours)).timestamp() * 1000)
+                        
+                        self.logger.debug(f"🔍 Проверка транзакций для формы {form_id} за последние {since_hours} часов")
+                        
+                        
                         recent_txs = self.tronscan.check_recent_transactions(
                             self.wallet_address, 
-                            since_timestamp=int((datetime.now() - timedelta(hours=1)).timestamp() * 1000)
+                            since_timestamp=since_timestamp
                         )
                         
-                        for tx in recent_txs:
+                        self.logger.info(f"📥 Получено {len(recent_txs)} транзакций за {since_hours}ч для проверки формы {form_id}")
+                        
+                        
+                        for i, tx in enumerate(recent_txs):
                             if not self.monitoring:
                                 break
                                 
+                            tx_hash = tx.get('hash', 'unknown')
+                            self.logger.debug(f"🔄 Обработка транзакции {i+1}/{len(recent_txs)}: {tx_hash[:16]}...")
+                                
                             try:
                                 parsed_tx = self.tronscan.parse_transaction(tx)
-                                if parsed_tx and self._is_payment_for_form(parsed_tx, form_data):
+                                
+                                if not parsed_tx:
+                                    self.logger.debug(f"⚠️  Транзакция {tx_hash[:16]} не удалось распарсить")
+                                    continue
+                                
+                                self.logger.info(f"💰 Распарсена транзакция: {parsed_tx['amount']} {parsed_tx['currency']} "
+                                                f"от {self._mask_wallet_address(parsed_tx['from_address'])} "
+                                                f"к {self._mask_wallet_address(parsed_tx['to_address'])}")
+                                
+                                
+                                if self._is_payment_for_form(parsed_tx, form_data):
+                                    self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
                                     self._process_payment(parsed_tx, form_id)
+                                else:
+                                    self.logger.debug(f"❌ Транзакция не подходит для формы {form_id}")
+                                    
                             except Exception as e:
-                                self.logger.error(f"Ошибка при обработке транзакции {tx.get('hash', 'unknown')}: {e}")
+                                self.logger.error(f"💥 Ошибка при обработке транзакции {tx_hash[:16]}: {e}")
                                 continue
                                 
                     except Exception as e:
@@ -617,49 +645,68 @@ class PaymentProcessor:
             return []
     
     def _is_payment_for_form(self, transaction: Dict, form_data: Dict) -> bool:
+        tx_id = transaction['transaction_id']
+        form_id = form_data['form_id']
+        
+        self.logger.debug(f"🔍 Проверка соответствия транзакции {tx_id[:16]} форме {form_id[:8]}")
         
         existing_tx = self.db.get_transaction_by_id(transaction['transaction_id'])
         if existing_tx:
-            self.logger.warning(f"Попытка повторной обработки транзакции {transaction['transaction_id']}")
+            self.logger.debug(f"🔄 Транзакция {tx_id[:16]} уже обработана ранее")
             return False
         
         from_address = transaction.get('from_address', '')
         if not self._validate_sender_address(from_address):
-            self.logger.warning(f"Невалидный адрес отправителя: {self._mask_wallet_address(from_address)}")
+            self.logger.debug(f"🚫 Невалидный отправитель: {self._mask_wallet_address(from_address)}")
             return False
         
         if not self._validate_transaction_timestamp(transaction):
+            self.logger.debug(f"⏰ Транзакция {tx_id[:16]} не прошла проверку времени")
             return False
         
         if not self._validate_transaction_confirmations(transaction):
+            self.logger.debug(f"📋 Транзакция {tx_id[:16]} недостаточно подтверждений")
             return False
         
         if not self._validate_usdt_contract(transaction):
+            self.logger.debug(f"📄 Транзакция {tx_id[:16]} неверный USDT контракт")
             return False
         
-        amount_match = abs(transaction['amount'] - form_data['amount']) < 0.000001
-        currency_match = transaction['currency'] == form_data['currency']
+        tx_amount = transaction['amount']
+        form_amount = form_data['amount'] 
+        amount_match = abs(tx_amount - form_amount) < 0.000001
         
-        address_match = transaction.get('to_address', '').lower() == self.wallet_address.lower()
+        tx_currency = transaction['currency']
+        form_currency = form_data['currency']
+        currency_match = tx_currency == form_currency
+        
+        tx_to_address = transaction.get('to_address', '').lower()
+        wallet_address = self.wallet_address.lower()
+        address_match = tx_to_address == wallet_address
         
         is_confirmed = transaction.get('confirmed', False)
         
+        self.logger.debug(f"📊 Проверка соответствия для {tx_id[:16]}:")
+        self.logger.debug(f"   💰 Сумма: {tx_amount} vs {form_amount} = {'✅' if amount_match else '❌'}")
+        self.logger.debug(f"   💱 Валюта: {tx_currency} vs {form_currency} = {'✅' if currency_match else '❌'}")
+        self.logger.debug(f"   📍 Адрес: {self._mask_wallet_address(tx_to_address)} vs {self._mask_wallet_address(wallet_address)} = {'✅' if address_match else '❌'}")
+        self.logger.debug(f"   ✔️  Подтверждена: {'✅' if is_confirmed else '❌'}")
+        
         if amount_match and currency_match and address_match and is_confirmed:
-            self.logger.info(f"Найдена подходящая транзакция {transaction['transaction_id']} для формы {form_data['form_id']}")
+            self.logger.info(f"🎉 НАЙДЕН ПОДХОДЯЩИЙ ПЛАТЕЖ! Транзакция {tx_id[:16]} → Форма {form_id[:8]}")
             return True
         
         reasons = []
         if not amount_match:
-            reasons.append(f"сумма не совпадает ({transaction['amount']} vs {form_data['amount']})")
+            reasons.append(f"сумма ({tx_amount} ≠ {form_amount})")
         if not currency_match:
-            reasons.append(f"валюта не совпадает ({transaction['currency']} vs {form_data['currency']})")
+            reasons.append(f"валюта ({tx_currency} ≠ {form_currency})")
         if not address_match:
-            reasons.append("адрес получателя не совпадает")
+            reasons.append(f"адрес ({self._mask_wallet_address(tx_to_address)} ≠ {self._mask_wallet_address(wallet_address)})")
         if not is_confirmed:
-            reasons.append("транзакция не подтверждена")
+            reasons.append("не подтверждена")
         
-        if reasons:
-            self.logger.debug(f"Транзакция {transaction['transaction_id']} отклонена: {', '.join(reasons)}")
+        self.logger.debug(f"❌ Транзакция {tx_id[:16]} отклонена: {', '.join(reasons)}")
         
         return False
     

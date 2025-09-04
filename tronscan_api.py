@@ -245,6 +245,54 @@ class TronScanAPI:
             self.logger.error(f"Ошибка при получении транзакций: {e}")
             return []
     
+    def get_trc20_transfers(self, address: str, limit: int = 20, start: int = 0) -> List[Dict]:
+        try:
+            url = f"{self.api_url}/token_trc20/transfers"
+            params = {
+                'relatedAddress': address,
+                'limit': min(limit, 50),
+                'start': max(start, 0),
+                'sort': '-timestamp'
+            }
+            
+            response = self._make_request(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            try:
+                data = response.json()
+            except ValueError as e:
+                self.logger.error(f"Некорректный JSON в ответе TRC20 API: {e}")
+                return []
+            
+            if 'token_transfers' in data:
+                transfers = data.get('token_transfers', [])
+            elif 'data' in data:
+                transfers = data.get('data', [])
+            else:
+                transfers = data if isinstance(data, list) else []
+            
+            trc20_transactions = []
+            for transfer in transfers:
+                try:
+                    tx = {
+                        'hash': transfer.get('transaction_id', ''),
+                        'timestamp': transfer.get('block_ts', 0),
+                        'confirmed': True,
+                        'contractType': 31,
+                        'trc20_transfer': transfer
+                    }
+                    trc20_transactions.append(tx)
+                except Exception as e:
+                    self.logger.warning(f"Ошибка при обработке TRC20 перевода: {e}")
+                    continue
+            
+            self.logger.info(f"Получено {len(trc20_transactions)} TRC20 переводов")
+            return trc20_transactions
+            
+        except requests.RequestException as e:
+            self.logger.error(f"Ошибка при получении TRC20 переводов: {e}")
+            return []
+    
     def get_transaction_details(self, transaction_id: str) -> Optional[Dict]:
         try:
             url = f"{self.api_url}/transaction-info"
@@ -278,13 +326,20 @@ class TronScanAPI:
             since_timestamp = int((datetime.now() - timedelta(hours=1)).timestamp() * 1000)
         
         transactions = self.get_account_transactions(wallet_address, limit=50)
+        trc20_transfers = self.get_trc20_transfers(wallet_address, limit=50)
+        all_transactions = transactions + trc20_transfers
         
         recent_transactions = []
-        for tx in transactions:
+        for tx in all_transactions:
             tx_timestamp = tx.get('timestamp', 0)
+            if tx_timestamp < 1000000000000:
+                tx_timestamp = tx_timestamp * 1000
+                
             if tx_timestamp >= since_timestamp:
                 recent_transactions.append(tx)
+        recent_transactions.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
         
+        self.logger.info(f"Найдено {len(recent_transactions)} транзакций (TRX: {len(transactions)}, TRC20: {len(trc20_transfers)})")
         return recent_transactions
     
     def is_transaction_confirmed(self, transaction_id: str) -> bool:
@@ -298,17 +353,55 @@ class TronScanAPI:
             tx_id = tx_data.get('hash', '')
             timestamp = tx_data.get('timestamp', 0)
             
+            self.logger.debug(f"🔄 Парсинг транзакции {tx_id[:16]}...")
+            
+            if 'trc20_transfer' in tx_data:
+                transfer = tx_data['trc20_transfer']
+                amount_str = transfer.get('quant', '0')
+                from_addr = transfer.get('from_address', '')
+                to_addr = transfer.get('to_address', '')
+                
+                token_info = transfer.get('tokenInfo', {})
+                symbol = token_info.get('tokenAbbr', 'UNKNOWN')
+                decimals = token_info.get('tokenDecimal', 6)
+                
+                try:
+                    amount = float(amount_str)
+                    if decimals > 0:
+                        amount = amount / (10 ** decimals)
+                except (ValueError, TypeError):
+                    amount = 0.0
+                
+                self.logger.debug(f"🪙 TRC20 перевод: {amount} {symbol} от {from_addr[:8]}...{from_addr[-4:]} к {to_addr[:8]}...{to_addr[-4:]}")
+                
+                return {
+                    'transaction_id': tx_id,
+                    'from_address': from_addr,
+                    'to_address': to_addr,
+                    'amount': amount,
+                    'currency': symbol,
+                    'timestamp': timestamp * 1000 if timestamp < 1000000000000 else timestamp,
+                    'confirmed': tx_data.get('confirmed', True)
+                }
+            
             tx_details = self.get_transaction_details(tx_id)
             if not tx_details:
+                self.logger.debug(f"❌ Не удалось получить детали транзакции {tx_id[:16]}")
                 return None
             
             transfers = tx_details.get('trc20TransferInfo', [])
+            confirmed = tx_details.get('confirmed', False)
+            
+            self.logger.debug(f"📋 Транзакция {tx_id[:16]}: подтверждена={confirmed}, TRC20 переводов={len(transfers)}")
+            
             if not transfers:
                 contract_data = tx_details.get('contractData', {})
                 if contract_data:
                     amount = contract_data.get('amount', 0) / 1000000
                     from_addr = contract_data.get('owner_address', '')
                     to_addr = contract_data.get('to_address', '')
+                    
+                    self.logger.debug(f"💎 TRX перевод: {amount} TRX от {from_addr[:8]}...{from_addr[-4:]} к {to_addr[:8]}...{to_addr[-4:]}")
                     
                     return {
                         'transaction_id': tx_id,
@@ -317,15 +410,21 @@ class TronScanAPI:
                         'amount': amount,
                         'currency': 'TRX',
                         'timestamp': timestamp,
-                        'confirmed': tx_details.get('confirmed', False)
+                        'confirmed': confirmed
                     }
             else:
-                for transfer in transfers:
+                for i, transfer in enumerate(transfers):
                     amount = float(transfer.get('amount_str', 0))
                     from_addr = transfer.get('from_address', '')
                     to_addr = transfer.get('to_address', '')
                     token_info = transfer.get('tokenInfo', {})
                     symbol = token_info.get('symbol', 'UNKNOWN')
+                    decimals = token_info.get('decimals', 6)
+                    
+                    if decimals > 0:
+                        amount = amount / (10 ** decimals)
+                    
+                    self.logger.debug(f"🪙 TRC20 перевод #{i+1}: {amount} {symbol} от {from_addr[:8]}...{from_addr[-4:]} к {to_addr[:8]}...{to_addr[-4:]}")
                     
                     return {
                         'transaction_id': tx_id,
@@ -334,12 +433,13 @@ class TronScanAPI:
                         'amount': amount,
                         'currency': symbol,
                         'timestamp': timestamp,
-                        'confirmed': tx_details.get('confirmed', False)
+                        'confirmed': confirmed
                     }
             
+            self.logger.debug(f"⚠️  Транзакция {tx_id[:16]} не содержит переводов")
             return None
         except Exception as e:
-            self.logger.error(f"Ошибка при парсинге транзакции: {e}")
+            self.logger.error(f"💥 Ошибка при парсинге транзакции {tx_id[:16] if 'tx_id' in locals() else 'unknown'}: {e}")
             return None
     
     def monitor_payments(self, wallet_address: str, callback_func, check_interval: int = 30):
