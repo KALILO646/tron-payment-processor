@@ -8,13 +8,13 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 class DatabaseManager:
-    def __init__(self, db_path: str = "transaction.db", pool_size: int = 5):
+    def __init__(self, db_path: str = "transaction.db", pool_size: int = None):
         self.db_path = db_path
         self._lock = threading.RLock()
         self.logger = logging.getLogger(__name__)
         
-        self.pool_size = pool_size
-        self.connection_pool = queue.Queue(maxsize=pool_size)
+        self.pool_size = pool_size or int(os.getenv('DB_POOL_SIZE', 5))
+        self.connection_pool = queue.Queue(maxsize=self.pool_size)
         self.pool_lock = threading.Lock()
         
         self.init_database()
@@ -28,16 +28,16 @@ class DatabaseManager:
     def _create_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
             self.db_path,
-            timeout=30.0,
+            timeout=float(os.getenv('DB_CONNECTION_TIMEOUT', 30.0)),
             isolation_level=None,
             check_same_thread=False
         )
         
         conn.execute('PRAGMA journal_mode=WAL')
         conn.execute('PRAGMA synchronous=NORMAL')
-        conn.execute('PRAGMA cache_size=10000')
+        conn.execute(f'PRAGMA cache_size={os.getenv("DB_CACHE_SIZE", 10000)}')
         conn.execute('PRAGMA temp_store=MEMORY')
-        conn.execute('PRAGMA mmap_size=268435456')
+        conn.execute(f'PRAGMA mmap_size={os.getenv("DB_MMAP_SIZE", 268435456)}')
         
         return conn
     
@@ -46,7 +46,7 @@ class DatabaseManager:
         conn = None
         from_pool = False
         try:
-            conn = self.connection_pool.get(timeout=10.0)
+            conn = self.connection_pool.get(timeout=float(os.getenv('DB_POOL_TIMEOUT', 10.0)))
             from_pool = True
             
             try:
@@ -127,11 +127,13 @@ class DatabaseManager:
             conn.commit()
     
     def create_payment_form(self, form_id: str, amount: float, currency: str, 
-                          description: str, wallet_address: str, expires_hours: int = 24) -> bool:
+                          description: str, wallet_address: str, expires_hours: int = None) -> bool:
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
                 
+                default_expires_hours = int(os.getenv('DEFAULT_FORM_EXPIRES_HOURS', 24))
+                expires_hours = expires_hours or default_expires_hours
                 expires_at = datetime.now().timestamp() + (expires_hours * 3600)
                 
                 cursor.execute('''

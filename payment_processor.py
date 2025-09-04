@@ -85,7 +85,16 @@ class PaymentProcessor:
             self._last_block_timestamp = 0
             self._form_cache = {}
             self._form_cache_lock = threading.Lock()
-            self._cache_expiry = 300
+            self._cache_expiry = int(os.getenv('CACHE_EXPIRY_SECONDS', 300))
+            
+            self._payment_processing_lock = threading.RLock()
+            self._transaction_processing_lock = threading.RLock()
+            self._form_status_lock = threading.RLock()
+
+            self._user_form_counts = {}
+            self._user_form_lock = threading.Lock()
+            self._user_last_form_time = {}
+            self._user_rate_limit_lock = threading.Lock()
             
             self.logger.info(f"PaymentProcessor инициализирован для кошелька: {self._mask_wallet_address(self.wallet_address)}")
             
@@ -121,29 +130,56 @@ class PaymentProcessor:
         if not isinstance(description, str):
             return False
             
-        if len(description) > 500:
+        max_description_length = int(os.getenv('MAX_DESCRIPTION_LENGTH', 500))
+        if len(description) > max_description_length:
             return False
         
-        dangerous_chars = ['<', '>', '"', "'", '&', '\n', '\r', '\t', '\0', '\x1a']
+        if len(description.strip()) == 0:
+            return True
+        
+        dangerous_chars = ['<', '>', '"', "'", '&', '\n', '\r', '\t', '\0', '\x1a', '\x00']
         if any(char in description for char in dangerous_chars):
             return False
         
         sql_keywords = ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'DROP', 'CREATE', 
-                       'ALTER', 'EXEC', 'UNION', 'SCRIPT', 'JAVASCRIPT']
+                       'ALTER', 'EXEC', 'UNION', 'SCRIPT', 'JAVASCRIPT', 'EXECUTE',
+                       'TRUNCATE', 'GRANT', 'REVOKE', 'COMMIT', 'ROLLBACK']
         description_upper = description.upper()
         if any(keyword in description_upper for keyword in sql_keywords):
             return False
         
         if any(ord(char) < 32 and char not in [' ', '\t'] for char in description):
             return False
+        
+        dangerous_patterns = [
+            r'javascript:',
+            r'data:text/html',
+            r'vbscript:',
+            r'<script[^>]*>',
+            r'</script>',
+            r'onload\s*=',
+            r'onerror\s*=',
+            r'onclick\s*=',
+            r'onmouseover\s*='
+        ]
+        
+        for pattern in dangerous_patterns:
+            if re.search(pattern, description, re.IGNORECASE):
+                return False
             
         return True
     
     def _validate_tron_address(self, address: str) -> bool:
-        if not address:
+        if not address or not isinstance(address, str):
+            return False
+        
+        if len(address) != 34:
             return False
         
         if not re.match(r'^T[A-Za-z0-9]{33}$', address):
+            return False
+        
+        if address == 'T0000000000000000000000000000000000':
             return False
         
         return True
@@ -152,7 +188,7 @@ class PaymentProcessor:
         if not isinstance(amount, (int, float)):
             return False
             
-        if not isinstance(currency, str):
+        if not isinstance(currency, str) or not currency.strip():
             return False
         
         try:
@@ -165,6 +201,10 @@ class PaymentProcessor:
             return False
         
         if amount <= 0:
+            return False
+        
+        max_amount_limit = float(os.getenv('MAX_AMOUNT_LIMIT', 1e15))
+        if amount > max_amount_limit:
             return False
         
         if amount != round(amount, 4):
@@ -210,14 +250,16 @@ class PaymentProcessor:
         tx_timestamp = transaction.get('timestamp', 0)
         current_time = int(datetime.now().timestamp() * 1000)
         
-        max_age = 2 * 60 * 60 * 1000
+        max_age_hours = int(os.getenv('MAX_TRANSACTION_AGE_HOURS', 2))
+        max_age = max_age_hours * 60 * 60 * 1000
         
         if current_time - tx_timestamp > max_age:
             age_minutes = (current_time - tx_timestamp) / 1000 / 60
             self.logger.warning(f"Транзакция слишком старая: {age_minutes:.1f} минут")
             return False
         
-        future_tolerance = 5 * 60 * 1000
+        future_tolerance_minutes = int(os.getenv('FUTURE_TOLERANCE_MINUTES', 5))
+        future_tolerance = future_tolerance_minutes * 60 * 1000
         
         if tx_timestamp > current_time + future_tolerance:
             self.logger.warning("Транзакция из будущего")
@@ -228,12 +270,13 @@ class PaymentProcessor:
     @retry_on_failure(max_retries=2, delay=2.0, exceptions=(Exception,))
     def _validate_transaction_confirmations(self, transaction: Dict) -> bool:
         min_confirmations = {
-            'USDT': 19,
-            'TRX': 19
+            'USDT': int(os.getenv('MIN_CONFIRMATIONS_USDT', 19)),
+            'TRX': int(os.getenv('MIN_CONFIRMATIONS_TRX', 19))
         }
         
         currency = transaction.get('currency', '')
-        required_confirmations = min_confirmations.get(currency, 19)
+        default_confirmations = int(os.getenv('DEFAULT_MIN_CONFIRMATIONS', 19))
+        required_confirmations = min_confirmations.get(currency, default_confirmations)
         
         try:
             tx_details = self.tronscan.get_transaction_details(transaction['transaction_id'])
@@ -297,11 +340,44 @@ class PaymentProcessor:
     
     def _check_form_creation_limits(self, client_ip: str = None, user_id: str = None):
         try:
-            active_forms_count = len(self.db.get_active_payment_forms(datetime.now().timestamp()))
-            max_total_forms = 1000
+            current_time = time.time()
+            
+            active_forms_count = len(self.db.get_active_payment_forms(current_time))
+            max_total_forms = int(os.getenv('MAX_TOTAL_FORMS', 1000))
             
             if active_forms_count >= max_total_forms:
                 raise Exception(f"Превышен общий лимит активных форм: {active_forms_count}/{max_total_forms}")
+            
+            with self._form_creation_lock:
+                time_since_last = current_time - self._last_form_creation_time
+                min_interval_seconds = float(os.getenv('MIN_FORM_CREATION_INTERVAL_SECONDS', 0.5))
+                if time_since_last < min_interval_seconds:
+                    raise Exception(f"Слишком частое создание форм. Подождите {min_interval_seconds - time_since_last:.1f} секунд")
+                self._last_form_creation_time = current_time
+            
+            if user_id:
+                if not self._validate_telegram_user_id(str(user_id)):
+                    raise ValueError("Некорректный user_id")
+                
+                with self._user_rate_limit_lock:
+                    user_key = str(user_id)
+                    
+                    if user_key in self._user_last_form_time:
+                        time_since_user_last = current_time - self._user_last_form_time[user_key]
+                        min_user_interval_seconds = float(os.getenv('MIN_USER_FORM_INTERVAL_SECONDS', 2.0))
+                        if time_since_user_last < min_user_interval_seconds:
+                            raise Exception(f"Слишком частое создание форм. Подождите {min_user_interval_seconds - time_since_user_last:.1f} секунд")
+                    
+                    if user_key in self._user_form_counts:
+                        user_forms_count = self._user_form_counts[user_key]
+                        max_user_forms_per_hour = int(os.getenv('MAX_USER_FORMS_PER_HOUR', 20))
+                        if user_forms_count >= max_user_forms_per_hour:
+                            raise Exception(f"Превышен лимит форм для пользователя: {user_forms_count}/{max_user_forms_per_hour} в час")
+                    
+                    self._user_last_form_time[user_key] = current_time
+                    self._user_form_counts[user_key] = self._user_form_counts.get(user_key, 0) + 1
+                    
+                    self._cleanup_user_counters(current_time)
             
             if client_ip:
                 self.logger.info(f"Создание формы с IP: {client_ip}")
@@ -309,16 +385,29 @@ class PaymentProcessor:
             if user_id:
                 self.logger.info(f"Создание формы для пользователя: {user_id}")
             
-            with self._form_creation_lock:
-                current_time = time.time()
-                time_since_last = current_time - self._last_form_creation_time
-                if time_since_last < 1.0:
-                    raise Exception(f"Слишком частое создание форм. Подождите {1.0 - time_since_last:.1f} секунд")
-                self._last_form_creation_time = current_time
-            
         except Exception as e:
             self.logger.error(f"Превышен лимит создания форм: {e}")
             raise
+    
+    def _cleanup_user_counters(self, current_time: float):
+        try:
+            cleanup_hours = int(os.getenv('USER_COUNTERS_CLEANUP_HOURS', 1))
+            hour_ago = current_time - (cleanup_hours * 3600)
+            
+            expired_users = [
+                user for user, last_time in self._user_last_form_time.items()
+                if last_time < hour_ago
+            ]
+            for user in expired_users:
+                del self._user_last_form_time[user]
+                if user in self._user_form_counts:
+                    del self._user_form_counts[user]
+            
+            if expired_users:
+                self.logger.debug(f"Очищены счетчики для {len(expired_users)} пользователей")
+                
+        except Exception as e:
+            self.logger.error(f"Ошибка при очистке счетчиков пользователей: {e}")
     
     def _get_recent_transaction_amounts(self, currency: str) -> List[float]:
         try:
@@ -493,6 +582,9 @@ class PaymentProcessor:
             raise Exception("Не удалось создать платежную форму")
     
     def get_payment_form(self, form_id: str) -> Optional[Dict]:
+        if not self._validate_form_id(form_id):
+            return None
+            
         with self._form_cache_lock:
             cache_key = f"form_{form_id}"
             current_time = time.time()
@@ -709,34 +801,40 @@ class PaymentProcessor:
         form_currency = form_data['currency']
         wallet_address_lower = self.wallet_address.lower()
         
-        for tx in transactions:
-            if not self.monitoring:
-                return False
-                
-            try:
-                tx_hash = tx.get('hash', '')
-                if self.db.get_transaction_by_id(tx_hash):
-                    continue
-                
-                parsed_tx = self._parse_transaction_fast(tx)
-                if not parsed_tx:
-                    continue
-                
-                if (abs(parsed_tx['amount'] - form_amount) < 0.0001 and
-                    parsed_tx['currency'] == form_currency and
-                    parsed_tx['to_address'].lower() == wallet_address_lower and
-                    parsed_tx.get('confirmed', False)):
+        with self._transaction_processing_lock:
+            for tx in transactions:
+                if not self.monitoring:
+                    return False
                     
-                    if self._validate_transaction_fast(parsed_tx):
-                        self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
-                        self._process_payment(parsed_tx, form_id)
-                        return True
+                try:
+                    tx_hash = tx.get('hash', '')
                     
-            except Exception as e:
-                tx_hash = tx.get('hash', 'unknown')
-                self.logger.error(f"Ошибка при обработке транзакции {tx_hash[:16]} для формы {form_id}: {e}")
-                continue
-                
+                    with self._transaction_cache_lock:
+                        if tx_hash in self._processed_transactions:
+                            continue
+                    
+                    if self.db.get_transaction_by_id(tx_hash):
+                        continue
+                    
+                    parsed_tx = self._parse_transaction_fast(tx)
+                    if not parsed_tx:
+                        continue
+                    
+                    if (abs(parsed_tx['amount'] - form_amount) < 0.0001 and
+                        parsed_tx['currency'] == form_currency and
+                        parsed_tx['to_address'].lower() == wallet_address_lower and
+                        parsed_tx.get('confirmed', False)):
+                        
+                        if self._validate_transaction_fast(parsed_tx):
+                            self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
+                            self._process_payment(parsed_tx, form_id)
+                            return True
+                        
+                except Exception as e:
+                    tx_hash = tx.get('hash', 'unknown')
+                    self.logger.error(f"Ошибка при обработке транзакции {tx_hash[:16]} для формы {form_id}: {e}")
+                    continue
+                    
         return False
     
     def _parse_transaction_fast(self, tx_data: Dict) -> Optional[Dict]:
@@ -856,25 +954,38 @@ class PaymentProcessor:
         return False
     
     def _process_payment(self, transaction: Dict, form_id: str):
-        result = self.db.process_payment_atomic(
-            transaction_id=transaction['transaction_id'],
-            from_address=transaction['from_address'],
-            to_address=transaction['to_address'],
-            amount=transaction['amount'],
-            currency=transaction['currency'],
-            form_id=form_id
-        )
-        
-        if result['status'] == 'success':
-            self.logger.info(f"Успешно обработан платеж для формы {form_id}: {self._mask_amount(transaction['amount'])} {transaction['currency']}")
+        with self._payment_processing_lock:
+            tx_id = transaction['transaction_id']
             
-            if form_id in self.payment_callbacks:
-                try:
-                    self.payment_callbacks[form_id](transaction, form_id)
-                except Exception as e:
-                    self.logger.error(f"Ошибка в callback для формы {form_id}: {e}")
-        else:
-            self.logger.warning(f"Не удалось обработать платеж для формы {form_id}: {result['message']}")
+            if tx_id in self._processed_transactions:
+                self.logger.debug(f"Транзакция {tx_id[:16]} уже обрабатывается")
+                return
+            
+            self._processed_transactions.add(tx_id)
+            
+            try:
+                result = self.db.process_payment_atomic(
+                    transaction_id=tx_id,
+                    from_address=transaction['from_address'],
+                    to_address=transaction['to_address'],
+                    amount=transaction['amount'],
+                    currency=transaction['currency'],
+                    form_id=form_id
+                )
+                
+                if result['status'] == 'success':
+                    self.logger.info(f"Успешно обработан платеж для формы {form_id}: {self._mask_amount(transaction['amount'])} {transaction['currency']}")
+                    
+                    if form_id in self.payment_callbacks:
+                        try:
+                            self.payment_callbacks[form_id](transaction, form_id)
+                        except Exception as e:
+                            self.logger.error(f"Ошибка в callback для формы {form_id}: {e}")
+                else:
+                    self.logger.warning(f"Не удалось обработать платеж для формы {form_id}: {result['message']}")
+                    
+            finally:
+                self._processed_transactions.discard(tx_id)
     
     def register_payment_callback(self, form_id: str, callback: Callable):
         self.payment_callbacks[form_id] = callback
@@ -895,3 +1006,32 @@ class PaymentProcessor:
             return True
         except ValueError:
             return False
+    
+    def _validate_telegram_user_id(self, user_id: str) -> bool:
+        if not user_id or not isinstance(user_id, str):
+            return False
+        
+        if not user_id.isdigit():
+            return False
+        
+        try:
+            user_id_int = int(user_id)
+            if user_id_int <= 0 or user_id_int > 2**63 - 1:
+                return False
+        except ValueError:
+            return False
+        
+        return True
+    
+    def _validate_form_id(self, form_id: str) -> bool:
+        if not form_id or not isinstance(form_id, str):
+            return False
+        
+        if len(form_id) != 36:
+            return False
+        
+        uuid_pattern = r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        if not re.match(uuid_pattern, form_id, re.IGNORECASE):
+            return False
+        
+        return True

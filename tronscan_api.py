@@ -6,12 +6,13 @@ from typing import List, Dict, Optional
 from datetime import datetime, timedelta
 from threading import Lock
 import urllib3
+import os
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class TronScanAPI:
     def __init__(self, api_url: str = "https://apilist.tronscanapi.com/api", 
-                 requests_per_minute: int = 20):
+                 requests_per_minute: int = None):
         
         self.logger = logging.getLogger(__name__)
         
@@ -31,15 +32,15 @@ class TronScanAPI:
             'Connection': 'keep-alive'
         })
         
-        self.requests_per_minute = requests_per_minute
+        self.requests_per_minute = requests_per_minute or int(os.getenv('API_REQUESTS_PER_MINUTE', 20))
         self.request_times = []
         self.rate_limit_lock = Lock()
-        self.min_request_interval = 60.0 / requests_per_minute
+        self.min_request_interval = 60.0 / self.requests_per_minute
         self.last_429_time = 0
         self.backoff_multiplier = 1
         self._response_cache = {}
         self._cache_lock = Lock()
-        self._cache_ttl = 30
+        self._cache_ttl = int(os.getenv('API_CACHE_TTL_SECONDS', 30))
     
     def _validate_api_url(self, url: str) -> bool:
         allowed_domains = [

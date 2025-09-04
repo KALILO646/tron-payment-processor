@@ -152,31 +152,83 @@ bot.polling()
 Создайте файл `.env` с необходимыми настройками:
 
 ```env
-WALLET_ADDRESS=TYourWalletAddressHere123456789012345
-
-DATABASE_PATH=transaction.db
+# Конфигурация TronScan API
 TRONSCAN_API_URL=https://apilist.tronscanapi.com/api
+WALLET_ADDRESS=
+
+# Конфигурация Telegram бота
+TELEGRAM_BOT_TOKEN=
+
+# Конфигурация базы данных
+DATABASE_PATH=transaction.db
+
+# Конфигурация мониторинга
+CHECK_INTERVAL=60
+
 API_RATE_LIMIT=20
+
 LOG_LEVEL=INFO
 
-# Лимиты сумм
 MAX_USDT_AMOUNT=10000.0
 MAX_TRX_AMOUNT=100000.0
 MIN_USDT_AMOUNT=0.1
 MIN_TRX_AMOUNT=1.0
 
-# Интервал проверки платежей 
 MONITOR_INTERVAL=30
 
-# Максимальное время жизни платежной формы в часах
-MAX_FORM_LIFETIME=24
+MAX_FORM_LIFETIME=2
 
-# Безопасность: заблокированные адреса (через запятую)
 BLACKLISTED_ADDRESSES=
 
-# Минимальное количество подтверждений блоков
 MIN_CONFIRMATIONS_USDT=19
 MIN_CONFIRMATIONS_TRX=19
+
+# Дополнительные переменные конфигурации
+# ======================================
+
+# Конфигурация API
+API_REQUESTS_PER_MINUTE=20
+API_CACHE_TTL_SECONDS=30
+
+# Конфигурация базы данных
+DB_POOL_SIZE=5
+DB_CONNECTION_TIMEOUT=30.0
+DB_POOL_TIMEOUT=10.0
+DB_CACHE_SIZE=10000
+DB_MMAP_SIZE=268435456
+
+# Конфигурация платежных форм
+DEFAULT_FORM_EXPIRES_HOURS=24
+MAX_TOTAL_FORMS=1000
+MIN_FORM_CREATION_INTERVAL_SECONDS=0.5
+MIN_USER_FORM_INTERVAL_SECONDS=2.0
+MAX_USER_FORMS_PER_HOUR=20
+USER_COUNTERS_CLEANUP_HOURS=1
+
+# Валидация транзакций
+MAX_TRANSACTION_AGE_HOURS=2
+FUTURE_TOLERANCE_MINUTES=5
+DEFAULT_MIN_CONFIRMATIONS=19
+
+# Валидация данных
+MAX_DESCRIPTION_LENGTH=500
+MAX_AMOUNT_LIMIT=1000000000000000.0
+
+# Кэширование
+CACHE_EXPIRY_SECONDS=300
+
+# Конфигурация QR-кодов
+QR_CODES_DIR=qr_codes
+QR_VERSION=1
+QR_ERROR_CORRECTION=L
+QR_BOX_SIZE=10
+QR_BORDER=4
+QR_DEFAULT_SIZE=300
+QR_FILL_COLOR=black
+QR_BACK_COLOR=white
+MAX_FILENAME_LENGTH=255
+MAX_QR_DATA_LENGTH=2000
+
 ```
 
 ## API методы
