@@ -54,7 +54,7 @@ pip install -r requirements.txt
 
 3. Создайте файл конфигурации `.env` на основе примера:
 ```bash
-cp config_example.env .env
+cp example.env .env
 ```
 
 4. Укажите ваш TRON кошелек в `.env`:
