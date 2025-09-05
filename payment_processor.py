@@ -446,6 +446,17 @@ class PaymentProcessor:
             return []
     
     def _get_blockchain_transaction_amounts(self, currency: str, hours_back: int = 1) -> List[float]:
+        cache_key = f"blockchain_amounts_{currency}_{hours_back}"
+        current_time = time.time()
+        
+        with self._api_cache_lock:
+            if cache_key in self._api_cache:
+                cached_data, cache_time = self._api_cache[cache_key]
+                if current_time - cache_time < self._api_cache_ttl:
+                    return cached_data
+                else:
+                    del self._api_cache[cache_key]
+        
         try:
             since_timestamp = int((datetime.now() - timedelta(hours=hours_back)).timestamp() * 1000)
             
@@ -468,6 +479,19 @@ class PaymentProcessor:
                         if len(amounts) >= 20:
                             break
             
+            with self._api_cache_lock:
+                self._api_cache[cache_key] = (amounts, current_time)
+                
+                max_api_cache_size = int(os.getenv('MAX_API_CACHE_SIZE', 100))
+                if len(self._api_cache) > max_api_cache_size:
+                    sorted_items = sorted(
+                        self._api_cache.items(),
+                        key=lambda x: x[1][1]
+                    )
+                    items_to_remove = len(self._api_cache) - max_api_cache_size + 20
+                    for key, _ in sorted_items[:items_to_remove]:
+                        del self._api_cache[key]
+            
             self.logger.debug(f"Получено {len(amounts)} сумм из блокчейна за {hours_back} часов")
             return amounts
             
@@ -477,7 +501,11 @@ class PaymentProcessor:
     
     def _generate_unique_amount(self, base_amount: float, currency: str, max_attempts: int = 100) -> float:
         recent_amounts = self._get_recent_transaction_amounts(currency)
-        recent_amounts_set = set(recent_amounts)
+        hours_back = int(os.getenv('UNIQUE_AMOUNT_CHECK_HOURS', 2))
+        blockchain_amounts = self._get_blockchain_transaction_amounts(currency, hours_back=hours_back)
+        
+        all_amounts = recent_amounts + blockchain_amounts
+        recent_amounts_sorted = sorted(set(all_amounts))
         
         for attempt in range(max_attempts):
             random_addition = secrets.randbelow(9999) / 10000.0
@@ -486,16 +514,17 @@ class PaymentProcessor:
             
             final_amount = round(base_amount + random_addition, 4)
             
-            if final_amount not in recent_amounts_set:
-                is_unique = True
-                for recent_amount in recent_amounts_set:
-                    if abs(final_amount - recent_amount) < 0.0001:
-                        is_unique = False
-                        break
-                
-                if is_unique:
-                    self.logger.debug(f"Сгенерирована уникальная сумма: {final_amount} (попытка {attempt + 1})")
-                    return final_amount
+            is_unique = True
+            for recent_amount in recent_amounts_sorted:
+                if abs(final_amount - recent_amount) < 0.0001:
+                    is_unique = False
+                    break
+                if recent_amount > final_amount + 0.0001:
+                    break
+            
+            if is_unique:
+                self.logger.debug(f"Сгенерирована уникальная сумма: {final_amount} (попытка {attempt + 1})")
+                return final_amount
         
         random_suffix = random.uniform(0.0001, 0.9999)
         final_amount = round(base_amount + random_suffix, 4)
@@ -853,17 +882,13 @@ class PaymentProcessor:
             try:
                 tx_hash = tx.get('hash', '')
                 
-                is_processed = False
                 with self._transaction_cache_lock:
-                    is_processed = tx_hash in self._processed_transactions
-                
-                if is_processed:
-                    continue
-                
-                if self.db.get_transaction_by_id(tx_hash):
-                    with self._transaction_cache_lock:
+                    if tx_hash in self._processed_transactions:
+                        continue
+                    
+                    if self.db.get_transaction_by_id(tx_hash):
                         self._processed_transactions.add(tx_hash)
-                    continue
+                        continue
                 
                 parsed_tx = self._parse_transaction_fast(tx)
                 if not parsed_tx:
