@@ -114,11 +114,12 @@ class TronScanAPI:
         if not url.startswith(self.api_url):
             raise ValueError(f"Подозрительный URL запроса: {url}")
         
+        last_exception = None
         
         for attempt in range(max_retries):
-            self._wait_for_rate_limit()
-            
             try:
+                self._wait_for_rate_limit()
+                
                 response = self.session.get(
                     url, 
                     params=params, 
@@ -136,30 +137,53 @@ class TronScanAPI:
                         self.logger.warning(f"Получена 429 ошибка, повтор через {retry_after} секунд (попытка {attempt + 1}/{max_retries})")
                         time.sleep(retry_after)
                         continue
+                    else:
+                        raise requests.exceptions.RequestException(f"Rate limit exceeded after {max_retries} attempts")
                 else:
                     if response.status_code == 200:
                         self.backoff_multiplier = 1
                         self.last_429_time = 0
+                    elif response.status_code >= 500:
+                        if attempt < max_retries - 1:
+                            self.logger.warning(f"Server error {response.status_code}, повтор через 10 секунд (попытка {attempt + 1}/{max_retries})")
+                            time.sleep(10)
+                            continue
+                        else:
+                            raise requests.exceptions.RequestException(f"Server error {response.status_code}")
+                    elif response.status_code >= 400:
+                        raise requests.exceptions.RequestException(f"Client error {response.status_code}")
                 
                 return response
                 
-            except requests.exceptions.Timeout:
+            except requests.exceptions.Timeout as e:
+                last_exception = e
                 if attempt < max_retries - 1:
                     self.logger.warning(f"Timeout при запросе к API, повтор через 5 секунд (попытка {attempt + 1}/{max_retries})")
                     time.sleep(5)
                     continue
-                raise
             except requests.exceptions.SSLError as e:
+                last_exception = e
                 self.logger.error(f"SSL ошибка при запросе к API: {e}")
-                raise
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+                    continue
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    self.logger.warning(f"Connection error, повтор через 10 секунд (попытка {attempt + 1}/{max_retries})")
+                    time.sleep(10)
+                    continue
             except requests.exceptions.RequestException as e:
+                last_exception = e
                 if attempt < max_retries - 1:
                     self.logger.warning(f"Ошибка запроса к API: {e}, повтор через 10 секунд (попытка {attempt + 1}/{max_retries})")
                     time.sleep(10)
                     continue
-                raise
         
-        raise requests.exceptions.RequestException(f"Не удалось выполнить запрос после {max_retries} попыток")
+        if last_exception:
+            raise last_exception
+        else:
+            raise requests.exceptions.RequestException(f"Не удалось выполнить запрос после {max_retries} попыток")
     
     def _validate_api_response(self, response_data: dict, expected_fields: list = None) -> bool:
         if not isinstance(response_data, dict):
@@ -232,7 +256,6 @@ class TronScanAPI:
             }
             
             response = self._make_request(url, params=params, timeout=5)
-            response.raise_for_status()
             
             try:
                 data = response.json()
@@ -266,6 +289,9 @@ class TronScanAPI:
         except requests.RequestException as e:
             self.logger.error(f"Ошибка при получении транзакций: {e}")
             return []
+        except Exception as e:
+            self.logger.error(f"Неожиданная ошибка при получении транзакций: {e}")
+            return []
     
     def get_trc20_transfers(self, address: str, limit: int = 20, start: int = 0) -> List[Dict]:
         cache_key = f"trc20_{address}_{limit}_{start}"
@@ -288,7 +314,6 @@ class TronScanAPI:
             }
             
             response = self._make_request(url, params=params, timeout=5)
-            response.raise_for_status()
             
             try:
                 data = response.json()
@@ -327,6 +352,9 @@ class TronScanAPI:
         except requests.RequestException as e:
             self.logger.error(f"Ошибка при получении TRC20 переводов: {e}")
             return []
+        except Exception as e:
+            self.logger.error(f"Неожиданная ошибка при получении TRC20 переводов: {e}")
+            return []
     
     def get_transaction_details(self, transaction_id: str) -> Optional[Dict]:
         try:
@@ -334,12 +362,18 @@ class TronScanAPI:
             params = {'hash': transaction_id}
             
             response = self._make_request(url, params=params, timeout=5)
-            response.raise_for_status()
             
-            data = response.json()
-            return data
+            try:
+                data = response.json()
+                return data
+            except ValueError as e:
+                self.logger.error(f"Некорректный JSON в ответе API для транзакции {transaction_id}: {e}")
+                return None
         except requests.RequestException as e:
-            self.logger.error(f"Ошибка при получении деталей транзакции: {e}")
+            self.logger.error(f"Ошибка при получении деталей транзакции {transaction_id}: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Неожиданная ошибка при получении деталей транзакции {transaction_id}: {e}")
             return None
     
     def get_account_info(self, address: str) -> Optional[Dict]:
@@ -348,40 +382,54 @@ class TronScanAPI:
             params = {'address': address}
             
             response = self._make_request(url, params=params, timeout=5)
-            response.raise_for_status()
             
-            data = response.json()
-            return data
+            try:
+                data = response.json()
+                return data
+            except ValueError as e:
+                self.logger.error(f"Некорректный JSON в ответе API для аккаунта {address}: {e}")
+                return None
         except requests.RequestException as e:
-            self.logger.error(f"Ошибка при получении информации об аккаунте: {e}")
+            self.logger.error(f"Ошибка при получении информации об аккаунте {address}: {e}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Неожиданная ошибка при получении информации об аккаунте {address}: {e}")
             return None
     
     def check_recent_transactions(self, wallet_address: str, since_timestamp: int = None) -> List[Dict]:
         if since_timestamp is None:
             since_timestamp = int((datetime.now() - timedelta(hours=2)).timestamp() * 1000)
         
-        transactions = self.get_account_transactions(wallet_address, limit=50)
-        trc20_transfers = self.get_trc20_transfers(wallet_address, limit=50)
-        all_transactions = transactions + trc20_transfers
-        
-        recent_transactions = []
-        for tx in all_transactions:
-            tx_timestamp = tx.get('timestamp', 0)
-            if tx_timestamp < 1000000000000:
-                tx_timestamp = tx_timestamp * 1000
-                
-            if tx_timestamp >= since_timestamp:
-                recent_transactions.append(tx)
-        recent_transactions.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
-        
-        self.logger.info(f"Найдено {len(recent_transactions)} транзакций за 2 часа (TRX: {len(transactions)}, TRC20: {len(trc20_transfers)})")
-        return recent_transactions
+        try:
+            transactions = self.get_account_transactions(wallet_address, limit=50)
+            trc20_transfers = self.get_trc20_transfers(wallet_address, limit=50)
+            all_transactions = transactions + trc20_transfers
+            
+            recent_transactions = []
+            for tx in all_transactions:
+                tx_timestamp = tx.get('timestamp', 0)
+                if tx_timestamp < 1000000000000:
+                    tx_timestamp = tx_timestamp * 1000
+                    
+                if tx_timestamp >= since_timestamp:
+                    recent_transactions.append(tx)
+            recent_transactions.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+            
+            self.logger.info(f"Найдено {len(recent_transactions)} транзакций за 2 часа (TRX: {len(transactions)}, TRC20: {len(trc20_transfers)})")
+            return recent_transactions
+        except Exception as e:
+            self.logger.error(f"Ошибка при проверке последних транзакций: {e}")
+            return []
     
     def is_transaction_confirmed(self, transaction_id: str) -> bool:
-        tx_details = self.get_transaction_details(transaction_id)
-        if tx_details:
-            return tx_details.get('confirmed', False)
-        return False
+        try:
+            tx_details = self.get_transaction_details(transaction_id)
+            if tx_details:
+                return tx_details.get('confirmed', False)
+            return False
+        except Exception as e:
+            self.logger.error(f"Ошибка при проверке подтверждения транзакции {transaction_id}: {e}")
+            return False
     
     def parse_transaction(self, tx_data: Dict) -> Optional[Dict]:
         try:
@@ -404,7 +452,7 @@ class TronScanAPI:
                     amount = float(amount_str)
                     if decimals > 0:
                         amount = amount / (10 ** decimals)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, ZeroDivisionError):
                     amount = 0.0
                 
                 self.logger.debug(f"🪙 TRC20 перевод: {amount} {symbol} от {from_addr[:8]}...{from_addr[-4:]} к {to_addr[:8]}...{to_addr[-4:]}")

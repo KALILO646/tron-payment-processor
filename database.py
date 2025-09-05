@@ -308,12 +308,6 @@ class DatabaseManager:
             cursor = conn.cursor()
             
             cursor.execute('''
-                UPDATE payment_forms 
-                SET status = 'expired', updated_at = CURRENT_TIMESTAMP 
-                WHERE status = 'pending' AND expires_at <= ?
-            ''', (current_time,))
-            
-            cursor.execute('''
                 SELECT * FROM payment_forms 
                 WHERE status = 'pending' AND expires_at > ?
                 ORDER BY created_at DESC
@@ -322,8 +316,21 @@ class DatabaseManager:
             rows = cursor.fetchall()
             columns = [description[0] for description in cursor.description]
             
-            conn.commit()
             return [dict(zip(columns, row)) for row in rows]
+    
+    def expire_old_forms(self, current_time: float) -> int:
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                UPDATE payment_forms 
+                SET status = 'expired', updated_at = CURRENT_TIMESTAMP 
+                WHERE status = 'pending' AND expires_at <= ?
+            ''', (current_time,))
+            
+            expired_count = cursor.rowcount
+            conn.commit()
+            return expired_count
     
     def get_all_payment_forms(self) -> List[Dict]:
         with self.get_connection() as conn:

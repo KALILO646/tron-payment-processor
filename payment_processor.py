@@ -299,8 +299,6 @@ class PaymentProcessor:
         if transaction.get('currency') != 'USDT':
             return True
         
-        
-        
         try:
             if 'trc20_transfer' in transaction:
                 trc20_data = transaction['trc20_transfer']
@@ -316,11 +314,11 @@ class PaymentProcessor:
             
             tx_details = self.tronscan.get_transaction_details(transaction['transaction_id'])
             if not tx_details:
-                return True
+                return False
             
             transfers = tx_details.get('trc20TransferInfo', [])
             if not transfers:
-                return True
+                return False
             
             for transfer in transfers:
                 token_info = transfer.get('tokenInfo', {})
@@ -332,7 +330,7 @@ class PaymentProcessor:
             return True
         except Exception as e:
             self.logger.error(f"Ошибка при проверке USDT контракта: {e}")
-            return True
+            return False
     
     def _generate_payment_hash(self, form_id: str, amount: float, currency: str) -> str:
         data = f"{form_id}:{amount}:{currency}:{datetime.now().isoformat()}"
@@ -727,6 +725,8 @@ class PaymentProcessor:
                                     form_data = future_to_form[future]
                                     form_id = form_data['form_id']
                                     self.logger.error(f"Ошибка при проверке формы {form_id}: {e}")
+                    
+                    self._cleanup_cache()
                                     
                 except Exception as e:
                     self.logger.error(f"Ошибка при получении транзакций: {e}")
@@ -768,6 +768,17 @@ class PaymentProcessor:
             
             return new_transactions
     
+    def _cleanup_cache(self):
+        with self._form_cache_lock:
+            current_time = time.time()
+            expired_keys = []
+            for key, (_, cache_time) in self._form_cache.items():
+                if current_time - cache_time > self._cache_expiry:
+                    expired_keys.append(key)
+            
+            for key in expired_keys:
+                del self._form_cache[key]
+    
     def _update_last_block_timestamp(self, transactions: List[Dict]):
         if transactions:
             max_timestamp = max(tx.get('timestamp', 0) for tx in transactions)
@@ -787,7 +798,12 @@ class PaymentProcessor:
                     else:
                         del self._form_cache[cache_key]
                 
-                active_forms = self.db.get_active_payment_forms(datetime.now().timestamp())
+                current_timestamp = datetime.now().timestamp()
+                expired_count = self.db.expire_old_forms(current_timestamp)
+                if expired_count > 0:
+                    self.logger.info(f"Истекло {expired_count} платежных форм")
+                
+                active_forms = self.db.get_active_payment_forms(current_timestamp)
                 self._form_cache[cache_key] = (active_forms, current_time)
                 
                 return active_forms
@@ -801,40 +817,39 @@ class PaymentProcessor:
         form_currency = form_data['currency']
         wallet_address_lower = self.wallet_address.lower()
         
-        with self._transaction_processing_lock:
-            for tx in transactions:
-                if not self.monitoring:
-                    return False
-                    
-                try:
-                    tx_hash = tx.get('hash', '')
-                    
-                    with self._transaction_cache_lock:
-                        if tx_hash in self._processed_transactions:
-                            continue
-                    
-                    if self.db.get_transaction_by_id(tx_hash):
+        for tx in transactions:
+            if not self.monitoring:
+                return False
+                
+            try:
+                tx_hash = tx.get('hash', '')
+                
+                with self._transaction_cache_lock:
+                    if tx_hash in self._processed_transactions:
                         continue
-                    
-                    parsed_tx = self._parse_transaction_fast(tx)
-                    if not parsed_tx:
-                        continue
-                    
-                    if (abs(parsed_tx['amount'] - form_amount) < 0.0001 and
-                        parsed_tx['currency'] == form_currency and
-                        parsed_tx['to_address'].lower() == wallet_address_lower and
-                        parsed_tx.get('confirmed', False)):
-                        
-                        if self._validate_transaction_fast(parsed_tx):
-                            self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
-                            self._process_payment(parsed_tx, form_id)
-                            return True
-                        
-                except Exception as e:
-                    tx_hash = tx.get('hash', 'unknown')
-                    self.logger.error(f"Ошибка при обработке транзакции {tx_hash[:16]} для формы {form_id}: {e}")
+                
+                if self.db.get_transaction_by_id(tx_hash):
                     continue
+                
+                parsed_tx = self._parse_transaction_fast(tx)
+                if not parsed_tx:
+                    continue
+                
+                if (abs(parsed_tx['amount'] - form_amount) < 0.0001 and
+                    parsed_tx['currency'] == form_currency and
+                    parsed_tx['to_address'].lower() == wallet_address_lower and
+                    parsed_tx.get('confirmed', False)):
                     
+                    if self._validate_transaction_fast(parsed_tx):
+                        self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
+                        self._process_payment(parsed_tx, form_id)
+                        return True
+                    
+            except Exception as e:
+                tx_hash = tx.get('hash', 'unknown')
+                self.logger.error(f"Ошибка при обработке транзакции {tx_hash[:16]} для формы {form_id}: {e}")
+                continue
+                
         return False
     
     def _parse_transaction_fast(self, tx_data: Dict) -> Optional[Dict]:
@@ -954,37 +969,45 @@ class PaymentProcessor:
         return False
     
     def _process_payment(self, transaction: Dict, form_id: str):
-        with self._payment_processing_lock:
-            tx_id = transaction['transaction_id']
-            
+        tx_id = transaction['transaction_id']
+        
+        with self._transaction_processing_lock:
             if tx_id in self._processed_transactions:
                 self.logger.debug(f"Транзакция {tx_id[:16]} уже обрабатывается")
                 return
             
-            self._processed_transactions.add(tx_id)
+            existing_tx = self.db.get_transaction_by_id(tx_id)
+            if existing_tx:
+                self.logger.debug(f"Транзакция {tx_id[:16]} уже существует в БД")
+                return
             
-            try:
-                result = self.db.process_payment_atomic(
-                    transaction_id=tx_id,
-                    from_address=transaction['from_address'],
-                    to_address=transaction['to_address'],
-                    amount=transaction['amount'],
-                    currency=transaction['currency'],
-                    form_id=form_id
-                )
+            self._processed_transactions.add(tx_id)
+        
+        try:
+            result = self.db.process_payment_atomic(
+                transaction_id=tx_id,
+                from_address=transaction['from_address'],
+                to_address=transaction['to_address'],
+                amount=transaction['amount'],
+                currency=transaction['currency'],
+                form_id=form_id
+            )
+            
+            if result['status'] == 'success':
+                self.logger.info(f"Успешно обработан платеж для формы {form_id}: {self._mask_amount(transaction['amount'])} {transaction['currency']}")
                 
-                if result['status'] == 'success':
-                    self.logger.info(f"Успешно обработан платеж для формы {form_id}: {self._mask_amount(transaction['amount'])} {transaction['currency']}")
-                    
-                    if form_id in self.payment_callbacks:
-                        try:
-                            self.payment_callbacks[form_id](transaction, form_id)
-                        except Exception as e:
-                            self.logger.error(f"Ошибка в callback для формы {form_id}: {e}")
-                else:
-                    self.logger.warning(f"Не удалось обработать платеж для формы {form_id}: {result['message']}")
-                    
-            finally:
+                if form_id in self.payment_callbacks:
+                    try:
+                        self.payment_callbacks[form_id](transaction, form_id)
+                    except Exception as e:
+                        self.logger.error(f"Ошибка в callback для формы {form_id}: {e}")
+            else:
+                self.logger.warning(f"Не удалось обработать платеж для формы {form_id}: {result['message']}")
+                
+        except Exception as e:
+            self.logger.error(f"Критическая ошибка при обработке платежа {tx_id[:16]}: {e}")
+        finally:
+            with self._transaction_processing_lock:
                 self._processed_transactions.discard(tx_id)
     
     def register_payment_callback(self, form_id: str, callback: Callable):
