@@ -54,8 +54,10 @@ def retry_on_failure(max_retries: int = 3, delay: float = 1.0, backoff: float = 
 class PaymentProcessor:
     OFFICIAL_USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
     
-    def __init__(self, log_level: str = "INFO"):
+    def __init__(self, log_level: str = None):
         self.logger = logging.getLogger(__name__)
+        if log_level is None:
+            log_level = os.getenv('LOG_LEVEL', 'INFO')
         self.logger.setLevel(getattr(logging, log_level.upper()))
         
         if not self.logger.handlers:
@@ -103,10 +105,15 @@ class PaymentProcessor:
             self._max_user_counters = int(os.getenv('MAX_USER_COUNTERS', 10000))
             
             self.logger.info(f"PaymentProcessor инициализирован для кошелька: {self._mask_wallet_address(self.wallet_address)}")
+            self.logger.info(f"Уровень логирования: {log_level}")
             
         except Exception as e:
             self.logger.error(f"Ошибка инициализации PaymentProcessor: {e}")
             raise
+
+    def set_log_level(self, level: str):
+        self.logger.setLevel(getattr(logging, level.upper()))
+        self.logger.info(f"Уровень логирования изменен на: {level.upper()}")
     
     def _mask_wallet_address(self, address: str) -> str:
         if not address or len(address) < 8:
@@ -256,7 +263,7 @@ class PaymentProcessor:
         tx_timestamp = transaction.get('timestamp', 0)
         current_time = int(datetime.now().timestamp() * 1000)
         
-        max_age_hours = int(os.getenv('MAX_TRANSACTION_AGE_HOURS', 2))
+        max_age_hours = int(os.getenv('MONITOR_TRANSACTION_HOURS', 2))
         max_age = max_age_hours * 60 * 60 * 1000
         
         if current_time - tx_timestamp > max_age:
@@ -737,8 +744,9 @@ class PaymentProcessor:
                 
                 self.logger.info(f"🔄 Начат цикл мониторинга: проверяем {len(pending_forms)} активных форм")
                 
+                monitor_hours = int(os.getenv('MONITOR_TRANSACTION_HOURS', 2))
                 since_timestamp = max(self._last_block_timestamp, 
-                                    int((datetime.now() - timedelta(hours=2)).timestamp() * 1000))
+                                    int((datetime.now() - timedelta(hours=monitor_hours)).timestamp() * 1000))
                 
                 try:
                     recent_txs = self.tronscan.check_recent_transactions(
@@ -748,7 +756,7 @@ class PaymentProcessor:
                     
                     new_transactions = self._filter_new_transactions(recent_txs)
                     
-                    self.logger.info(f"📥 Получено {len(new_transactions)} новых транзакций из {len(recent_txs)} за 2 часа для проверки {len(pending_forms)} форм")
+                    self.logger.info(f"📥 Получено {len(new_transactions)} новых транзакций из {len(recent_txs)} за {monitor_hours} часов для проверки {len(pending_forms)} форм")
                     
                     if new_transactions:
                         self._update_last_block_timestamp(new_transactions)
@@ -807,12 +815,16 @@ class PaymentProcessor:
                     if tx_hash not in self._processed_transactions:
                         self._processed_transactions.add(tx_hash)
                         new_transactions.append(tx)
+                        self.logger.debug(f"🆕 Новая транзакция: {tx_hash[:16]}")
+                    else:
+                        self.logger.debug(f"⏭️ Транзакция уже обработана: {tx_hash[:16]}")
             
             if len(self._processed_transactions) > self._max_processed_transactions:
                 oldest_txs = list(self._processed_transactions)[:5000]
                 for tx_hash in oldest_txs:
                     self._processed_transactions.discard(tx_hash)
-            
+                self.logger.info(f"🧹 Очищен кэш: удалено {len(oldest_txs)} старых транзакций")
+                        
             return new_transactions
     
     def _cleanup_cache(self):
@@ -875,6 +887,8 @@ class PaymentProcessor:
         form_currency = form_data['currency']
         wallet_address_lower = self.wallet_address.lower()
         
+        self.logger.debug(f"🔍 Проверка формы {form_id} (сумма: {form_amount} {form_currency}) против {len(transactions)} транзакций")
+        
         for tx in transactions:
             if not self.monitoring:
                 return False
@@ -892,17 +906,37 @@ class PaymentProcessor:
                 
                 parsed_tx = self._parse_transaction_fast(tx)
                 if not parsed_tx:
+                    self.logger.debug(f"❌ Не удалось распарсить транзакцию {tx_hash[:16]}")
                     continue
                 
-                if (abs(parsed_tx['amount'] - form_amount) < 0.0001 and
-                    parsed_tx['currency'] == form_currency and
-                    parsed_tx['to_address'].lower() == wallet_address_lower and
-                    parsed_tx.get('confirmed', False)):
-                    
+                amount_diff = abs(parsed_tx['amount'] - form_amount)
+                currency_match = parsed_tx['currency'] == form_currency
+                address_match = parsed_tx['to_address'].lower() == wallet_address_lower
+                confirmed = parsed_tx.get('confirmed', False)
+                
+                self.logger.debug(f"🔍 Проверка транзакции {tx_hash[:16]} для формы {form_id}:")
+                self.logger.debug(f"  Сумма: {parsed_tx['amount']} vs {form_amount} (разница: {amount_diff})")
+                self.logger.debug(f"  Валюта: {parsed_tx['currency']} vs {form_currency} (совпадает: {currency_match})")
+                self.logger.debug(f"  Адрес: {parsed_tx['to_address'][:10]}... vs {wallet_address_lower[:10]}... (совпадает: {address_match})")
+                self.logger.debug(f"  Подтверждена: {confirmed}")
+                
+                if (amount_diff < 0.0001 and currency_match and address_match and confirmed):
                     if self._validate_transaction_fast(parsed_tx):
                         self.logger.info(f"✅ Найден подходящий платеж для формы {form_id}!")
                         self._process_payment(parsed_tx, form_id)
                         return True
+                    else:
+                        self.logger.warning(f"❌ Транзакция {tx_hash[:16]} не прошла валидацию для формы {form_id}")
+                else:
+                    self.logger.debug(f"❌ Транзакция {tx_hash[:16]} не подходит для формы {form_id}")
+                    if not confirmed:
+                        self.logger.debug(f"   Причина: транзакция не подтверждена")
+                    if amount_diff >= 0.0001:
+                        self.logger.debug(f"   Причина: разница в суммах {amount_diff}")
+                    if not currency_match:
+                        self.logger.debug(f"   Причина: не совпадает валюта")
+                    if not address_match:
+                        self.logger.debug(f"   Причина: не совпадает адрес")
                     
             except Exception as e:
                 tx_hash = tx.get('hash', 'unknown')

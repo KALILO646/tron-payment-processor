@@ -225,8 +225,8 @@ class TronScanAPI:
         timestamp = tx_data.get('timestamp', 0)
         current_time = int(datetime.now().timestamp() * 1000)
         
-        max_age_days = int(os.getenv('MAX_TRANSACTION_AGE_DAYS', 30))
-        max_age = max_age_days * 24 * 60 * 60 * 1000
+        max_age_hours = int(os.getenv('MONITOR_TRANSACTION_HOURS', 2))
+        max_age = max_age_hours * 60 * 60 * 1000
         
         if timestamp < current_time - max_age:
             self.logger.error(f"Транзакция слишком старая: {timestamp}")
