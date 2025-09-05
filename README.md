@@ -51,7 +51,7 @@
 git clone https://github.com/KALILO646/tron-payment-processor
 cd tron-payment-processor
 ```
-3. Установите необходимые зависимости:
+2. Установите необходимые зависимости:
 ```bash
 pip install -r requirements.txt
 ```
