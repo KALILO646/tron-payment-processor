@@ -4,6 +4,7 @@ import threading
 import logging
 import queue
 import contextlib
+import time
 from datetime import datetime
 from typing import List, Dict, Optional
 
@@ -97,6 +98,8 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_transaction_id ON transactions(transaction_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_payment_form_id ON transactions(payment_form_id)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_status ON transactions(status)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_created_at ON transactions(created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_transactions_status_created ON transactions(status, created_at)')
             
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS payment_forms (
@@ -117,12 +120,20 @@ class DatabaseManager:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_status ON payment_forms(status)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_expires ON payment_forms(expires_at)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_status_expires ON payment_forms(status, expires_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_created_at ON payment_forms(created_at)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_form_status_created ON payment_forms(status, created_at)')
             
-            try:
-                cursor.execute('ALTER TABLE payment_forms ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
-                self.logger.info("Добавлена колонка updated_at в таблицу payment_forms")
-            except sqlite3.OperationalError:
-                pass
+            cursor.execute("PRAGMA user_version")
+            version_result = cursor.fetchone()
+            current_version = version_result[0] if version_result else 0
+            
+            if current_version < 1:
+                try:
+                    cursor.execute('ALTER TABLE payment_forms ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP')
+                    cursor.execute("PRAGMA user_version = 1")
+                    self.logger.info("Добавлена колонка updated_at в таблицу payment_forms")
+                except sqlite3.OperationalError:
+                    pass
             
             conn.commit()
     
@@ -168,61 +179,71 @@ class DatabaseManager:
     
     def process_payment_atomic(self, transaction_id: str, from_address: str, to_address: str,
                               amount: float, currency: str, form_id: str) -> Dict[str, str]:
-        with self._lock:
-            with self.get_connection() as conn:
-                cursor = conn.cursor()
-                
-                try:
-                    cursor.execute('BEGIN IMMEDIATE')
+        max_retries = 3
+        for attempt in range(max_retries):
+            with self._lock:
+                with self.get_connection() as conn:
+                    cursor = conn.cursor()
                     
-                    cursor.execute('SELECT id FROM transactions WHERE transaction_id = ?', (transaction_id,))
-                    if cursor.fetchone():
+                    try:
+                        cursor.execute('BEGIN IMMEDIATE')
+                        
+                        cursor.execute('SELECT id FROM transactions WHERE transaction_id = ?', (transaction_id,))
+                        if cursor.fetchone():
+                            conn.rollback()
+                            return {'status': 'error', 'message': 'Transaction already processed'}
+                        
+                        cursor.execute('''
+                            SELECT status, expires_at, amount, currency 
+                            FROM payment_forms 
+                            WHERE form_id = ? AND status = 'pending'
+                        ''', (form_id,))
+                        
+                        form_row = cursor.fetchone()
+                        if not form_row:
+                            conn.rollback()
+                            return {'status': 'error', 'message': 'Payment form not found or not pending'}
+                        
+                        form_status, expires_at, expected_amount, expected_currency = form_row
+                        
+                        if datetime.now().timestamp() > expires_at:
+                            conn.rollback()
+                            return {'status': 'error', 'message': 'Payment form expired'}
+                        
+                        if abs(amount - expected_amount) > 0.0001 or currency != expected_currency:
+                            conn.rollback()
+                            return {'status': 'error', 'message': 'Amount or currency mismatch'}
+                        
+                        cursor.execute('''
+                            INSERT INTO transactions 
+                            (transaction_id, from_address, to_address, amount, currency, status, payment_form_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ''', (transaction_id, from_address, to_address, amount, currency, 'confirmed', form_id))
+                        
+                        cursor.execute('''
+                            UPDATE payment_forms 
+                            SET status = 'paid', updated_at = CURRENT_TIMESTAMP 
+                            WHERE form_id = ? AND status = 'pending'
+                        ''', (form_id,))
+                        
+                        if cursor.rowcount == 0:
+                            conn.rollback()
+                            return {'status': 'error', 'message': 'Payment form was already processed'}
+                        
+                        conn.commit()
+                        return {'status': 'success', 'message': 'Payment processed successfully'}
+                        
+                    except sqlite3.OperationalError as e:
                         conn.rollback()
-                        return {'status': 'error', 'message': 'Transaction already processed'}
-                    
-                    cursor.execute('''
-                        SELECT status, expires_at, amount, currency 
-                        FROM payment_forms 
-                        WHERE form_id = ?
-                    ''', (form_id,))
-                    
-                    form_row = cursor.fetchone()
-                    if not form_row:
+                        if 'database is locked' in str(e).lower() and attempt < max_retries - 1:
+                            time.sleep(0.1 * (2 ** attempt))
+                            continue
+                        return {'status': 'error', 'message': f'Database error: {e}'}
+                    except sqlite3.Error as e:
                         conn.rollback()
-                        return {'status': 'error', 'message': 'Payment form not found'}
-                    
-                    form_status, expires_at, expected_amount, expected_currency = form_row
-                    
-                    if form_status != 'pending':
-                        conn.rollback()
-                        return {'status': 'error', 'message': 'Payment form not pending'}
-                    
-                    if datetime.now().timestamp() > expires_at:
-                        conn.rollback()
-                        return {'status': 'error', 'message': 'Payment form expired'}
-                    
-                    if abs(amount - expected_amount) > 0.0001 or currency != expected_currency:
-                        conn.rollback()
-                        return {'status': 'error', 'message': 'Amount or currency mismatch'}
-                    
-                    cursor.execute('''
-                        INSERT INTO transactions 
-                        (transaction_id, from_address, to_address, amount, currency, status, payment_form_id)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ''', (transaction_id, from_address, to_address, amount, currency, 'confirmed', form_id))
-                    
-                    cursor.execute('''
-                        UPDATE payment_forms 
-                        SET status = 'paid', updated_at = CURRENT_TIMESTAMP 
-                        WHERE form_id = ?
-                    ''', (form_id,))
-                    
-                    conn.commit()
-                    return {'status': 'success', 'message': 'Payment processed successfully'}
-                    
-                except sqlite3.Error as e:
-                    conn.rollback()
-                    return {'status': 'error', 'message': f'Database error: {e}'}
+                        return {'status': 'error', 'message': f'Database error: {e}'}
+        
+        return {'status': 'error', 'message': 'Max retries exceeded'}
     
     def add_transaction(self, transaction_id: str, from_address: str, to_address: str,
                        amount: float, currency: str, status: str, 

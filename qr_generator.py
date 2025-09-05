@@ -111,7 +111,8 @@ class QRCodeGenerator:
         if not re.match(r'^[a-zA-Z0-9._-]+$', filename):
             return False
         
-        if not filename.endswith('.png'):
+        valid_extensions = ['.png', '.jpg', '.jpeg', '.gif', '.bmp']
+        if not any(filename.lower().endswith(ext) for ext in valid_extensions):
             return False
         
         return True

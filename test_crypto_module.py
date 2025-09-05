@@ -207,11 +207,20 @@ class TestTronScanAPI:
             assert isinstance(result, list)
     
     def test_rate_limiting(self):
+        original_requests_per_minute = self.api.requests_per_minute
+        self.api.requests_per_minute = 1
+        
         start_time = time.time()
         self.api._wait_for_rate_limit()
-        end_time = time.time()
+        first_call_time = time.time()
         
-        assert end_time - start_time < 1.0
+        self.api._wait_for_rate_limit()
+        second_call_time = time.time()
+        
+        self.api.requests_per_minute = original_requests_per_minute
+        
+        assert first_call_time - start_time < 1.0
+        assert second_call_time - first_call_time >= 3.0
 
 
 class TestPaymentProcessor:

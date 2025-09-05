@@ -9,6 +9,7 @@ import hashlib
 import re
 import functools
 import math
+import collections
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import ipaddress
 from datetime import datetime, timedelta
@@ -81,11 +82,15 @@ class PaymentProcessor:
             self._form_creation_lock = threading.Lock()
             self._last_form_creation_time = 0
             self._processed_transactions = set()
+            self._max_processed_transactions = 10000
             self._transaction_cache_lock = threading.Lock()
             self._last_block_timestamp = 0
             self._form_cache = {}
             self._form_cache_lock = threading.Lock()
             self._cache_expiry = int(os.getenv('CACHE_EXPIRY_SECONDS', 300))
+            self._api_cache = {}
+            self._api_cache_lock = threading.Lock()
+            self._api_cache_ttl = int(os.getenv('API_CACHE_TTL_SECONDS', 30))
             
             self._payment_processing_lock = threading.RLock()
             self._transaction_processing_lock = threading.RLock()
@@ -95,6 +100,7 @@ class PaymentProcessor:
             self._user_form_lock = threading.Lock()
             self._user_last_form_time = {}
             self._user_rate_limit_lock = threading.Lock()
+            self._max_user_counters = int(os.getenv('MAX_USER_COUNTERS', 10000))
             
             self.logger.info(f"PaymentProcessor инициализирован для кошелька: {self._mask_wallet_address(self.wallet_address)}")
             
@@ -267,8 +273,10 @@ class PaymentProcessor:
         
         return True
     
-    @retry_on_failure(max_retries=2, delay=2.0, exceptions=(Exception,))
     def _validate_transaction_confirmations(self, transaction: Dict) -> bool:
+        if transaction.get('confirmed', False):
+            return True
+        
         min_confirmations = {
             'USDT': int(os.getenv('MIN_CONFIRMATIONS_USDT', 19)),
             'TRX': int(os.getenv('MIN_CONFIRMATIONS_TRX', 19))
@@ -294,7 +302,6 @@ class PaymentProcessor:
             self.logger.error(f"Ошибка при проверке подтверждений: {e}")
             return False
     
-    @retry_on_failure(max_retries=2, delay=1.0, exceptions=(Exception,))
     def _validate_usdt_contract(self, transaction: Dict) -> bool:
         if transaction.get('currency') != 'USDT':
             return True
@@ -312,21 +319,17 @@ class PaymentProcessor:
                 else:
                     return True
             
-            tx_details = self.tronscan.get_transaction_details(transaction['transaction_id'])
-            if not tx_details:
-                return False
+            if 'trc20TransferInfo' in transaction:
+                transfers = transaction['trc20TransferInfo']
+                for transfer in transfers:
+                    token_info = transfer.get('tokenInfo', {})
+                    contract_address = token_info.get('tokenId', '')
+                    
+                    if contract_address and contract_address != self.OFFICIAL_USDT_CONTRACT:
+                        self.logger.warning(f"❌ Поддельный USDT контракт: {contract_address}")
+                        return False
+                return True
             
-            transfers = tx_details.get('trc20TransferInfo', [])
-            if not transfers:
-                return False
-            
-            for transfer in transfers:
-                token_info = transfer.get('tokenInfo', {})
-                contract_address = token_info.get('tokenId', '')
-                
-                if contract_address and contract_address != self.OFFICIAL_USDT_CONTRACT:
-                    self.logger.warning(f"❌ Поддельный USDT контракт: {contract_address}")
-                    return False
             return True
         except Exception as e:
             self.logger.error(f"Ошибка при проверке USDT контракта: {e}")
@@ -389,20 +392,32 @@ class PaymentProcessor:
     
     def _cleanup_user_counters(self, current_time: float):
         try:
-            cleanup_hours = int(os.getenv('USER_COUNTERS_CLEANUP_HOURS', 1))
-            hour_ago = current_time - (cleanup_hours * 3600)
+            max_users = int(os.getenv('MAX_USER_COUNTERS', 10000))
             
-            expired_users = [
-                user for user, last_time in self._user_last_form_time.items()
-                if last_time < hour_ago
-            ]
-            for user in expired_users:
-                del self._user_last_form_time[user]
-                if user in self._user_form_counts:
-                    del self._user_form_counts[user]
-            
-            if expired_users:
-                self.logger.debug(f"Очищены счетчики для {len(expired_users)} пользователей")
+            if len(self._user_last_form_time) > max_users:
+                cleanup_hours = int(os.getenv('USER_COUNTERS_CLEANUP_HOURS', 1))
+                hour_ago = current_time - (cleanup_hours * 3600)
+                
+                expired_users = [
+                    user for user, last_time in self._user_last_form_time.items()
+                    if last_time < hour_ago
+                ]
+                
+                for user in expired_users:
+                    del self._user_last_form_time[user]
+                    if user in self._user_form_counts:
+                        del self._user_form_counts[user]
+                
+                if expired_users:
+                    self.logger.debug(f"Очищены счетчики для {len(expired_users)} пользователей")
+                
+                if len(self._user_last_form_time) > max_users:
+                    oldest_users = sorted(self._user_last_form_time.items(), key=lambda x: x[1])[:len(self._user_last_form_time) - max_users + 1000]
+                    for user, _ in oldest_users:
+                        del self._user_last_form_time[user]
+                        if user in self._user_form_counts:
+                            del self._user_form_counts[user]
+                    self.logger.warning(f"Принудительная очистка счетчиков: удалено {len(oldest_users)} пользователей")
                 
         except Exception as e:
             self.logger.error(f"Ошибка при очистке счетчиков пользователей: {e}")
@@ -436,7 +451,7 @@ class PaymentProcessor:
             
             blockchain_txs = self.tronscan.get_account_transactions(
                 self.wallet_address, 
-                limit=100,
+                limit=20,
                 start=0
             )
             
@@ -444,13 +459,13 @@ class PaymentProcessor:
             for tx in blockchain_txs:
                 tx_timestamp = tx.get('timestamp', 0)
                 if tx_timestamp < since_timestamp:
-                    continue
+                    break
                     
                 parsed_tx = self.tronscan.parse_transaction(tx)
                 if parsed_tx and parsed_tx['currency'] == currency:
                     if parsed_tx['to_address'].lower() == self.wallet_address.lower():
                         amounts.append(parsed_tx['amount'])
-                        if len(amounts) >= 50:
+                        if len(amounts) >= 20:
                             break
             
             self.logger.debug(f"Получено {len(amounts)} сумм из блокчейна за {hours_back} часов")
@@ -462,6 +477,7 @@ class PaymentProcessor:
     
     def _generate_unique_amount(self, base_amount: float, currency: str, max_attempts: int = 100) -> float:
         recent_amounts = self._get_recent_transaction_amounts(currency)
+        recent_amounts_set = set(recent_amounts)
         
         for attempt in range(max_attempts):
             random_addition = secrets.randbelow(9999) / 10000.0
@@ -470,19 +486,20 @@ class PaymentProcessor:
             
             final_amount = round(base_amount + random_addition, 4)
             
-            is_unique = True
-            for recent_amount in recent_amounts:
-                if abs(final_amount - recent_amount) < 0.0001:
-                    is_unique = False
-                    break
-            
-            if is_unique:
-                self.logger.debug(f"Сгенерирована уникальная сумма: {final_amount} (попытка {attempt + 1})")
-                return final_amount
+            if final_amount not in recent_amounts_set:
+                is_unique = True
+                for recent_amount in recent_amounts_set:
+                    if abs(final_amount - recent_amount) < 0.0001:
+                        is_unique = False
+                        break
+                
+                if is_unique:
+                    self.logger.debug(f"Сгенерирована уникальная сумма: {final_amount} (попытка {attempt + 1})")
+                    return final_amount
         
-        timestamp_suffix = int(datetime.now().timestamp() * 1000) % 10000 / 10000.0
-        final_amount = round(base_amount + timestamp_suffix, 4)
-        self.logger.warning(f"Использована временная метка для генерации суммы: {final_amount}")
+        random_suffix = random.uniform(0.0001, 0.9999)
+        final_amount = round(base_amount + random_suffix, 4)
+        self.logger.warning(f"Использован случайный суффикс для генерации суммы: {final_amount}")
         return final_amount
     
     def _check_recent_transactions(self, amount: float, currency: str) -> bool:
@@ -757,11 +774,12 @@ class PaymentProcessor:
             new_transactions = []
             for tx in transactions:
                 tx_hash = tx.get('hash', '')
-                if tx_hash and tx_hash not in self._processed_transactions:
-                    new_transactions.append(tx)
-                    self._processed_transactions.add(tx_hash)
+                if tx_hash:
+                    if tx_hash not in self._processed_transactions:
+                        self._processed_transactions.add(tx_hash)
+                        new_transactions.append(tx)
             
-            if len(self._processed_transactions) > 10000:
+            if len(self._processed_transactions) > self._max_processed_transactions:
                 oldest_txs = list(self._processed_transactions)[:5000]
                 for tx_hash in oldest_txs:
                     self._processed_transactions.discard(tx_hash)
@@ -771,13 +789,24 @@ class PaymentProcessor:
     def _cleanup_cache(self):
         with self._form_cache_lock:
             current_time = time.time()
-            expired_keys = []
-            for key, (_, cache_time) in self._form_cache.items():
-                if current_time - cache_time > self._cache_expiry:
-                    expired_keys.append(key)
             
-            for key in expired_keys:
+            keys_to_remove = [
+                key for key, (_, cache_time) in self._form_cache.items()
+                if current_time - cache_time > self._cache_expiry
+            ]
+            
+            for key in keys_to_remove:
                 del self._form_cache[key]
+            
+            max_cache_size = int(os.getenv('MAX_FORM_CACHE_SIZE', 1000))
+            if len(self._form_cache) > max_cache_size:
+                sorted_items = sorted(
+                    self._form_cache.items(),
+                    key=lambda x: x[1][1]
+                )
+                items_to_remove = len(self._form_cache) - max_cache_size + 100
+                for key, _ in sorted_items[:items_to_remove]:
+                    del self._form_cache[key]
     
     def _update_last_block_timestamp(self, transactions: List[Dict]):
         if transactions:
@@ -824,11 +853,16 @@ class PaymentProcessor:
             try:
                 tx_hash = tx.get('hash', '')
                 
+                is_processed = False
                 with self._transaction_cache_lock:
-                    if tx_hash in self._processed_transactions:
-                        continue
+                    is_processed = tx_hash in self._processed_transactions
+                
+                if is_processed:
+                    continue
                 
                 if self.db.get_transaction_by_id(tx_hash):
+                    with self._transaction_cache_lock:
+                        self._processed_transactions.add(tx_hash)
                     continue
                 
                 parsed_tx = self._parse_transaction_fast(tx)
@@ -976,12 +1010,13 @@ class PaymentProcessor:
                 self.logger.debug(f"Транзакция {tx_id[:16]} уже обрабатывается")
                 return
             
+            self._processed_transactions.add(tx_id)
+            
             existing_tx = self.db.get_transaction_by_id(tx_id)
             if existing_tx:
                 self.logger.debug(f"Транзакция {tx_id[:16]} уже существует в БД")
+                self._processed_transactions.discard(tx_id)
                 return
-            
-            self._processed_transactions.add(tx_id)
         
         try:
             result = self.db.process_payment_atomic(

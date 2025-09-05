@@ -89,7 +89,7 @@ class TronScanAPI:
             self.request_times = [t for t in self.request_times if current_time - t < 60]
             
             if len(self.request_times) >= self.requests_per_minute:
-                sleep_time = 60 - (current_time - self.request_times[0]) + 5
+                sleep_time = 60 - (current_time - self.request_times[0])
                 if sleep_time > 0:
                     self.logger.info(f"Rate limit: ожидание {sleep_time:.1f} секунд")
                     time.sleep(sleep_time)
@@ -225,11 +225,17 @@ class TronScanAPI:
         timestamp = tx_data.get('timestamp', 0)
         current_time = int(datetime.now().timestamp() * 1000)
         
-        if timestamp < current_time - (365 * 24 * 60 * 60 * 1000):
+        max_age_days = int(os.getenv('MAX_TRANSACTION_AGE_DAYS', 30))
+        max_age = max_age_days * 24 * 60 * 60 * 1000
+        
+        if timestamp < current_time - max_age:
             self.logger.error(f"Транзакция слишком старая: {timestamp}")
             return False
         
-        if timestamp > current_time + (24 * 60 * 60 * 1000):
+        future_tolerance_hours = int(os.getenv('FUTURE_TOLERANCE_HOURS', 2))
+        future_tolerance = future_tolerance_hours * 60 * 60 * 1000
+        
+        if timestamp > current_time + future_tolerance:
             self.logger.error(f"Транзакция из будущего: {timestamp}")
             return False
         
@@ -279,9 +285,11 @@ class TronScanAPI:
                 self._response_cache[cache_key] = (validated_transactions, time.time())
                 
                 if len(self._response_cache) > 100:
-                    oldest_key = min(self._response_cache.keys(), 
-                                   key=lambda k: self._response_cache[k][1])
-                    del self._response_cache[oldest_key]
+                    sorted_items = sorted(self._response_cache.items(), 
+                                        key=lambda x: x[1][1])
+                    items_to_remove = len(self._response_cache) - 50
+                    for key, _ in sorted_items[:items_to_remove]:
+                        del self._response_cache[key]
             
             self.logger.info(f"Получено {len(validated_transactions)} валидных транзакций из {len(transactions)}")
             return validated_transactions
